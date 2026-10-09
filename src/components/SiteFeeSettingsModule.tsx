@@ -76,12 +76,15 @@ export const SiteFeeSettingsModule: React.FC<SiteFeeSettingsModuleProps> = ({
   const fetchSettings = async () => {
     setIsLoading(true);
     try {
-      const res = await fetch('/api/admin/site-settings');
+      let res = await fetch('/api/admin/site-settings');
+      if (!res.ok && res.status === 404) {
+        res = await fetch('/api/admin/settings');
+      }
       if (res.ok) {
         const data = await res.json();
-        setSettings(data);
+        const loaded = data.settings || data;
+        setSettings(prev => ({ ...prev, ...loaded }));
       } else {
-        // Fallback default
         setSettings(DEFAULT_SETTINGS);
       }
     } catch (err) {
@@ -102,15 +105,23 @@ export const SiteFeeSettingsModule: React.FC<SiteFeeSettingsModuleProps> = ({
         updatedBy: currentUser?.name ? `${currentUser.name} (${currentUser.role || 'Admin'})` : 'Super Admin'
       };
 
-      const res = await fetch('/api/admin/site-settings', {
+      let res = await fetch('/api/admin/site-settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
 
+      if (!res.ok && res.status === 404) {
+        res = await fetch('/api/admin/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+      }
+
       if (res.ok) {
-        const data = await res.json();
-        const saved = data.settings || payload;
+        const data = await res.json().catch(() => ({ settings: payload }));
+        const saved = data.settings || data || payload;
         setSettings(saved);
         if (onSettingsSaved) {
           onSettingsSaved(saved);
@@ -120,17 +131,23 @@ export const SiteFeeSettingsModule: React.FC<SiteFeeSettingsModuleProps> = ({
           text: 'Site & Fee settings saved successfully and active across marketplace!'
         });
       } else {
-        const err = await res.json();
+        let errorMsg = 'Failed to save settings to server.';
+        try {
+          const err = await res.json();
+          if (err && err.error) errorMsg = err.error;
+        } catch {
+          // ignore non-json error responses
+        }
         setToastMessage({
           type: 'error',
-          text: err.error || 'Failed to save settings to server.'
+          text: errorMsg
         });
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
       setToastMessage({
         type: 'error',
-        text: 'Network error occurred while saving settings.'
+        text: err?.message ? `Network error: ${err.message}` : 'Network error occurred while saving settings.'
       });
     } finally {
       setIsSaving(false);

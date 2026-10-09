@@ -266,7 +266,7 @@ export class FinanceLedgerEngine {
   }
 
   // Replay protection for caller-supplied request keys (double-clicks, client retries).
-  private replay<T>(requestKey: string | undefined): T | undefined {
+  public replay<T>(requestKey: string | undefined): T | undefined {
     if (!requestKey) return undefined;
     return this.opResults.get(requestKey) as T | undefined;
   }

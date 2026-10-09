@@ -34888,7 +34888,7 @@ var require_gaxios = __commonJS({
     var retry_js_1 = require_retry3();
     var stream_1 = __require("stream");
     var interceptor_js_1 = require_interceptor();
-    var randomUUID = async () => globalThis.crypto?.randomUUID() || (await import("crypto")).randomUUID();
+    var randomUUID3 = async () => globalThis.crypto?.randomUUID() || (await import("crypto")).randomUUID();
     var HTTP_STATUS_NO_CONTENT = 204;
     var Gaxios = class {
       agentCache = /* @__PURE__ */ new Map();
@@ -35161,7 +35161,7 @@ var require_gaxios = __commonJS({
          */
         ["Blob", "File", "FormData"].includes(opts.data?.constructor?.name || "");
         if (opts.multipart?.length) {
-          const boundary = await randomUUID();
+          const boundary = await randomUUID3();
           preparedHeaders.set("content-type", `multipart/related; boundary=${boundary}`);
           opts.body = stream_1.Readable.from(this.getMultipartRequest(opts.multipart, boundary));
         } else if (shouldDirectlyPassData) {
@@ -39912,12 +39912,12 @@ var require_jwa = __commonJS({
       };
     }
     var bufferEqual;
-    var timingSafeEqual = "timingSafeEqual" in crypto2 ? function timingSafeEqual2(a, b) {
+    var timingSafeEqual2 = "timingSafeEqual" in crypto2 ? function timingSafeEqual3(a, b) {
       if (a.byteLength !== b.byteLength) {
         return false;
       }
       return crypto2.timingSafeEqual(a, b);
-    } : function timingSafeEqual2(a, b) {
+    } : function timingSafeEqual3(a, b) {
       if (!bufferEqual) {
         bufferEqual = require_buffer_equal_constant_time();
       }
@@ -39926,7 +39926,7 @@ var require_jwa = __commonJS({
     function createHmacVerifier(bits) {
       return function verify(thing, signature, secret) {
         var computedSig = createHmacSigner(bits)(thing, secret);
-        return timingSafeEqual(Buffer4.from(signature), Buffer4.from(computedSig));
+        return timingSafeEqual2(Buffer4.from(signature), Buffer4.from(computedSig));
       };
     }
     function createKeySigner(bits) {
@@ -68668,8 +68668,10 @@ function getApiKeyFromEnv() {
 
 // server.ts
 var import_dotenv = __toESM(require_main(), 1);
+import { randomUUID as randomUUID2, timingSafeEqual } from "crypto";
 
 // src/server/financeLedger.ts
+import { randomUUID } from "node:crypto";
 var CHART_OF_ACCOUNTS = [
   { code: "1010", name: "Operating Cash & Bank", type: "asset", normalBalance: "debit", description: "Settled operational funds in platform bank accounts" },
   { code: "1020", name: "Payment Processor Clearing", type: "asset", normalBalance: "debit", description: "Stripe & Razorpay clearing accounts awaiting platform settlement" },
@@ -68678,11 +68680,21 @@ var CHART_OF_ACCOUNTS = [
   { code: "2020", name: "Freelancer Wallets Payable", type: "liability", normalBalance: "credit", description: "Withdrawable earnings owed to freelance talent" },
   { code: "2030", name: "Marketplace Escrow Funds in Trust", type: "liability", normalBalance: "credit", description: "Order funds held in escrow under 14-day protection" },
   { code: "2040", name: "Pending Payout Liabilities", type: "liability", normalBalance: "credit", description: "Requested withdrawals queued for bank or UPI transfer" },
+  { code: "3010", name: "Opening Balance Equity", type: "equity", normalBalance: "credit", description: "Opening balances carried over when the ledger was introduced" },
   { code: "2050", name: "Pending Refund Liabilities", type: "liability", normalBalance: "credit", description: "Approved refund amounts queued for payment processor reversal" },
   { code: "4010", name: "Marketplace Platform Commission Fee", type: "revenue", normalBalance: "credit", description: "10% marketplace commission earned on completed orders" },
   { code: "5010", name: "Payment Processing Gateway Fees", type: "expense", normalBalance: "debit", description: "Merchant fees charged by Stripe, Razorpay, or banks" },
   { code: "5020", name: "Administrative & Goodwill Adjustments", type: "expense", normalBalance: "debit", description: "Compensatory credits and goodwill dispute write-offs" }
 ];
+var MAX_AMOUNT = 1e6;
+var DEFAULT_CURRENCY = "USD";
+var nowStr = () => (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").substring(0, 19);
+function csvText(v) {
+  let t2 = String(v ?? "");
+  if (/^[=+\-@\t\r]/.test(t2)) t2 = "'" + t2;
+  return `"${t2.replace(/"/g, '""')}"`;
+}
+var csvNum = (n) => Number.isFinite(n) ? n.toFixed(2) : "0.00";
 var FinanceLedgerEngine = class _FinanceLedgerEngine {
   constructor() {
     this.journals = [];
@@ -68691,29 +68703,84 @@ var FinanceLedgerEngine = class _FinanceLedgerEngine {
     this.auditLogs = [];
     this.exceptions = [];
     this.idempotencyKeys = /* @__PURE__ */ new Set();
+    this.escrows = /* @__PURE__ */ new Map();
+    this.payouts = /* @__PURE__ */ new Map();
+    this.opResults = /* @__PURE__ */ new Map();
     this.platformCommissionRate = 10;
+    this.minimumOrderAmount = 10;
+    this.minimumWithdrawalAmount = 50;
+    this.maximumWithdrawalAmount = 5e3;
     this.seedInitialFinancialData();
   }
+  // ----- configuration -----------------------------------------------------
+  configure(cfg) {
+    if (cfg.commissionPercent !== void 0) this.setPlatformCommissionRate(cfg.commissionPercent);
+    if (typeof cfg.minimumOrderAmount === "number" && cfg.minimumOrderAmount >= 0) this.minimumOrderAmount = cfg.minimumOrderAmount;
+    if (typeof cfg.minimumWithdrawalAmount === "number" && cfg.minimumWithdrawalAmount >= 0) this.minimumWithdrawalAmount = cfg.minimumWithdrawalAmount;
+    if (typeof cfg.maximumWithdrawalAmount === "number" && cfg.maximumWithdrawalAmount > 0) this.maximumWithdrawalAmount = cfg.maximumWithdrawalAmount;
+  }
   setPlatformCommissionRate(rate) {
-    if (typeof rate === "number" && rate >= 0 && rate <= 100) {
+    if (typeof rate === "number" && Number.isFinite(rate) && rate >= 0 && rate <= 100) {
       this.platformCommissionRate = rate;
     }
   }
   getPlatformCommissionRate() {
     return this.platformCommissionRate;
   }
-  // Exact dollar rounding helper to prevent IEEE 754 floating point drift
+  // ----- money safety ------------------------------------------------------
   static round(val) {
     return Math.round((val + Number.EPSILON) * 100) / 100;
   }
-  // Seed authoritative balanced double-entry journals matching the system's existing orders, payouts, and balances
+  // Validates a user-supplied amount: finite number, > 0, max 2 decimals, below a sane ceiling.
+  static assertMoney(v, label = "Amount") {
+    if (typeof v !== "number" || !Number.isFinite(v)) throw new Error(`${label} must be a valid number.`);
+    if (v <= 0) throw new Error(`${label} must be greater than 0.`);
+    if (Math.abs(v * 100 - Math.round(v * 100)) > 1e-6) throw new Error(`${label} can have at most 2 decimal places.`);
+    if (v > MAX_AMOUNT) throw new Error(`${label} exceeds the maximum allowed (${MAX_AMOUNT}).`);
+    return Math.round(v * 100) / 100;
+  }
+  static assertReason(reason, label = "A reason") {
+    if (typeof reason !== "string" || reason.trim().length < 5) throw new Error(`${label} (min 5 characters) is required.`);
+    return reason.trim();
+  }
+  walletAccount(w) {
+    return w.userRole === "buyer" ? "2010" : "2020";
+  }
+  requireWallet(userId) {
+    const w = this.wallets.get(userId);
+    if (!w) throw new Error(`Wallet not found for user ${userId}`);
+    return w;
+  }
+  audit(a) {
+    this.auditLogs.unshift({
+      id: `FAUD-${randomUUID().slice(0, 12)}`,
+      actor: a.actor,
+      role: a.role || "super_admin",
+      action: a.action,
+      target: a.target,
+      reason: a.reason,
+      journalId: a.journalId,
+      timestamp: nowStr()
+    });
+  }
+  // Replay protection for caller-supplied request keys (double-clicks, client retries).
+  replay(requestKey) {
+    if (!requestKey) return void 0;
+    return this.opResults.get(requestKey);
+  }
+  remember(requestKey, result) {
+    if (requestKey) this.opResults.set(requestKey, result);
+    return result;
+  }
+  // ----- seed data ---------------------------------------------------------
+  // Wallet balances are NEVER seeded directly: every balance is produced by a posted journal.
   seedInitialFinancialData() {
     const initialUsers = [
-      { id: "user_1", name: "Elena Rostova", email: "elena@workperhour.com", role: "freelancer", initialBalance: 4250 },
-      { id: "user_2", name: "Marcus Vance", email: "marcus@vance.io", role: "buyer", initialBalance: 12e3 },
-      { id: "user_3", name: "Aarav Patel", email: "aarav@cloudscale.in", role: "freelancer", initialBalance: 0 },
-      { id: "user_bk", name: "Bushra Khan", email: "bushra@creatives.co", role: "freelancer", initialBalance: 1850 },
-      { id: "user_admin", name: "Super Admin", email: "admin@workperhour.com", role: "admin", initialBalance: 0 }
+      { id: "user_1", name: "Elena Rostova", email: "elena@workperhour.com", role: "freelancer" },
+      { id: "user_2", name: "Marcus Vance", email: "marcus@vance.io", role: "buyer" },
+      { id: "user_3", name: "Aarav Patel", email: "aarav@cloudscale.in", role: "freelancer" },
+      { id: "user_bk", name: "Bushra Khan", email: "bushra@creatives.co", role: "freelancer" },
+      { id: "user_admin", name: "Super Admin", email: "admin@workperhour.com", role: "admin" }
     ];
     for (const u of initialUsers) {
       this.wallets.set(u.id, {
@@ -68722,76 +68789,42 @@ var FinanceLedgerEngine = class _FinanceLedgerEngine {
         userName: u.name,
         userEmail: u.email,
         userRole: u.role,
-        currency: "USD",
-        availableBalance: u.initialBalance,
+        currency: DEFAULT_CURRENCY,
+        availableBalance: 0,
         pendingIncoming: 0,
-        fundsOnHold: u.id === "user_2" ? 1600 : 0,
-        // Marcus has funded active orders in escrow ($800 + $450 + $350)
+        fundsOnHold: 0,
         pendingWithdrawals: 0,
         status: "active",
         lastActivityAt: "2026-10-07 14:30:00",
-        createdAt: "2026-09-01 10:00:00"
+        createdAt: "2026-09-15 08:00:00"
       });
     }
     this.postJournal({
       reference: "DEP-STRIPE-89320",
       description: "Stripe Bank Checkout Deposit - Marcus Vance Pre-funding",
       eventType: "DEPOSIT_SETTLED",
-      idempotencyKey: "IDEMP-DEP-101",
+      idempotencyKey: "IDEMP-DEP-89320",
       actor: "Payment Gateway (Stripe)",
       timestamp: "2026-10-01 09:15:00",
       entries: [
-        { accountCode: "1020", accountName: "Payment Processor Clearing", debit: 13600, credit: 0, currency: "USD", description: "Stripe clearing deposit received", userId: "user_2" },
-        { accountCode: "2010", accountName: "Buyer Wallets Payable", debit: 0, credit: 13600, currency: "USD", description: "Credited Marcus Vance available wallet", userId: "user_2" }
+        { accountCode: "1020", debit: 13750, credit: 0, currency: DEFAULT_CURRENCY, description: "Stripe clearing deposit received", userId: "user_2" },
+        { accountCode: "2010", debit: 0, credit: 13750, currency: DEFAULT_CURRENCY, description: "Credited Marcus Vance available wallet", userId: "user_2" }
       ]
     });
-    this.postJournal({
-      reference: "ORD-1-ESCROW-LOCK",
-      description: "Escrow funding for Order #ord_1 (I will build a high performance full stack web app in react and node)",
-      eventType: "ORDER_ESCROW_FUNDED",
-      idempotencyKey: "IDEMP-ORD-1",
-      actor: "System Escrow Vault",
-      timestamp: "2026-10-05 11:00:00",
-      entries: [
-        { accountCode: "2010", accountName: "Buyer Wallets Payable", debit: 800, credit: 0, currency: "USD", description: "Debited buyer wallet for order escrow funding", userId: "user_2", orderId: "ord_1" },
-        { accountCode: "2030", accountName: "Marketplace Escrow Funds in Trust", debit: 0, credit: 800, currency: "USD", description: "Locked in 14-day escrow protection vault", orderId: "ord_1" }
-      ]
-    });
-    this.postJournal({
-      reference: "ORD-BK-ESCROW-LOCK",
-      description: "Escrow funding for Order #ord_bk (Create an amazing promotional explainer video a puppet)",
-      eventType: "ORDER_ESCROW_FUNDED",
-      idempotencyKey: "IDEMP-ORD-BK",
-      actor: "System Escrow Vault",
-      timestamp: "2026-10-06 14:20:00",
-      entries: [
-        { accountCode: "2010", accountName: "Buyer Wallets Payable", debit: 450, credit: 0, currency: "USD", description: "Debited buyer wallet for order escrow funding", userId: "user_2", orderId: "ord_bk" },
-        { accountCode: "2030", accountName: "Marketplace Escrow Funds in Trust", debit: 0, credit: 450, currency: "USD", description: "Locked in 14-day escrow protection vault", orderId: "ord_bk" }
-      ]
-    });
-    this.postJournal({
-      reference: "ORD-BUSHRA-ESCROW-LOCK",
-      description: "Escrow funding for Order #ord_bushra (I will increase ahrefs domain rating dr 70 using high authority SEO backlinks)",
-      eventType: "ORDER_ESCROW_FUNDED",
-      idempotencyKey: "IDEMP-ORD-BUSHRA",
-      actor: "System Escrow Vault",
-      timestamp: "2026-10-07 10:10:00",
-      entries: [
-        { accountCode: "2010", accountName: "Buyer Wallets Payable", debit: 350, credit: 0, currency: "USD", description: "Debited buyer wallet for order escrow funding", userId: "user_2", orderId: "ord_bushra" },
-        { accountCode: "2030", accountName: "Marketplace Escrow Funds in Trust", debit: 0, credit: 350, currency: "USD", description: "Locked in 14-day escrow protection vault", orderId: "ord_bushra" }
-      ]
-    });
+    this.fundEscrow({ orderId: "ord_1", orderTitle: "I will build a high performance full stack web app in react and node", amount: 950, buyerId: "user_2", sellerId: "user_1", actor: "System Escrow Vault", timestamp: "2026-10-05 11:00:00", skipMinimum: true });
+    this.fundEscrow({ orderId: "ord_bk", orderTitle: "Create an amazing promotional explainer video a puppet", amount: 450, buyerId: "user_2", sellerId: "user_bk", actor: "System Escrow Vault", timestamp: "2026-10-06 14:20:00", skipMinimum: true });
+    this.fundEscrow({ orderId: "ord_bushra", orderTitle: "I will increase ahrefs domain rating dr 70 using high authority SEO backlinks", amount: 350, buyerId: "user_2", sellerId: "user_3", actor: "System Escrow Vault", timestamp: "2026-10-07 10:10:00", skipMinimum: true });
     this.postJournal({
       reference: "ORD-HIST-COMPLETED-ELENA",
       description: "Completed Enterprise Migration Order Release to Freelancer Elena Rostova",
       eventType: "ESCROW_RELEASED_TO_FREELANCER",
-      idempotencyKey: "IDEMP-ORD-HIST-ELENA",
+      idempotencyKey: "IDEMP-HIST-ELENA",
       actor: "System Auto-Release",
       timestamp: "2026-10-03 16:45:00",
       entries: [
-        { accountCode: "1020", accountName: "Payment Processor Clearing", debit: 5750, credit: 0, currency: "USD", description: "Incoming settled contract funds" },
-        { accountCode: "2020", accountName: "Freelancer Wallets Payable", debit: 0, credit: 5175, currency: "USD", description: "Net earnings credited to Elena Rostova (90%)", userId: "user_1" },
-        { accountCode: "4010", accountName: "Marketplace Platform Commission Fee", debit: 0, credit: 575, currency: "USD", description: "10% Platform commission revenue" }
+        { accountCode: "1020", debit: 5750, credit: 0, currency: DEFAULT_CURRENCY, description: "Incoming settled contract funds" },
+        { accountCode: "2020", debit: 0, credit: 5175, currency: DEFAULT_CURRENCY, description: "Net earnings credited to Elena Rostova (90%)", userId: "user_1" },
+        { accountCode: "4010", debit: 0, credit: 575, currency: DEFAULT_CURRENCY, description: "10% Platform commission revenue" }
       ]
     });
     this.postJournal({
@@ -68802,56 +68835,45 @@ var FinanceLedgerEngine = class _FinanceLedgerEngine {
       actor: "Payout Gateway (UPI/RazorpayX)",
       timestamp: "2026-10-04 15:30:00",
       entries: [
-        { accountCode: "2020", accountName: "Freelancer Wallets Payable", debit: 1500, credit: 0, currency: "USD", description: "Debited freelancer wallet balance for payout", userId: "user_1", payoutId: "pay_1" },
-        { accountCode: "1030", accountName: "Payout Gateway Transit", debit: 0, credit: 1500, currency: "USD", description: "Disbursed via UPI payment partner transit", payoutId: "pay_1" }
+        { accountCode: "2020", debit: 1500, credit: 0, currency: DEFAULT_CURRENCY, description: "Debited freelancer wallet balance for payout", userId: "user_1", payoutId: "pay_1" },
+        { accountCode: "1030", debit: 0, credit: 1500, currency: DEFAULT_CURRENCY, description: "Disbursed via UPI payment partner transit", payoutId: "pay_1" }
+      ]
+    });
+    this.payouts.set("pay_1", { id: "pay_1", freelancerId: "user_1", amount: 1500, method: "UPI", accountDetails: "elena@upi", status: "settled", attempt: 1 });
+    this.postJournal({
+      reference: "OPENING-BALANCE-BUSHRA",
+      description: "Opening wallet balance carried over for Bushra Khan",
+      eventType: "OPENING_BALANCE",
+      idempotencyKey: "IDEMP-OPEN-BUSHRA",
+      actor: "System Migration",
+      timestamp: "2026-10-01 00:00:00",
+      entries: [
+        { accountCode: "3010", debit: 1850, credit: 0, currency: DEFAULT_CURRENCY, description: "Opening balance equity" },
+        { accountCode: "2020", debit: 0, credit: 1850, currency: DEFAULT_CURRENCY, description: "Opening balance credited to Bushra Khan", userId: "user_bk" }
       ]
     });
     this.auditLogs.push(
-      {
-        id: "FAUD-101",
-        actor: "Stripe Webhook Gateway",
-        role: "system",
-        action: "DEPOSIT_CONFIRMED",
-        target: "Wallet #WAL-USER_2",
-        reason: "Payment Intent #pi_3Mtz924 confirmed settlement in bank clearing",
-        journalId: this.journals[0]?.id,
-        timestamp: "2026-10-01 09:15:00"
-      },
-      {
-        id: "FAUD-102",
-        actor: "Escrow Vault Controller",
-        role: "system",
-        action: "ESCROW_FUNDS_LOCKED",
-        target: "Order #ord_1",
-        reason: "Mandatory 14-day escrow protection locking $800 from buyer wallet",
-        journalId: this.journals[1]?.id,
-        timestamp: "2026-10-05 11:00:00"
-      },
-      {
-        id: "FAUD-103",
-        actor: "Admin Chief",
-        role: "super_admin",
-        action: "PAYOUT_APPROVED_AND_SETTLED",
-        target: "Payout #pay_1",
-        reason: "Processed UPI withdrawal for freelancer Elena Rostova after KYC verification",
-        journalId: this.journals[4]?.id,
-        timestamp: "2026-10-04 15:30:00"
-      }
+      { id: "FAUD-101", actor: "Stripe Webhook Gateway", role: "system", action: "DEPOSIT_CONFIRMED", target: "Wallet #WAL-USER_2", reason: "Payment Intent #pi_3Mtz924 confirmed settlement in bank clearing", journalId: this.journals.find((j) => j.reference === "DEP-STRIPE-89320")?.id, timestamp: "2026-10-01 09:15:00" },
+      { id: "FAUD-103", actor: "Admin Chief", role: "super_admin", action: "PAYOUT_APPROVED_AND_SETTLED", target: "Payout #pay_1", reason: "Processed UPI withdrawal for freelancer Elena Rostova after KYC verification", journalId: this.journals.find((j) => j.reference === "PAY-1-SETTLED-UPI")?.id, timestamp: "2026-10-04 15:30:00" }
     );
     this.exceptions.push({
       id: "REC-EX-001",
       type: "gateway_mismatch",
       entityId: "PAY-PROV-REF-STRIPE-994",
       amount: 14.5,
-      currency: "USD",
+      currency: DEFAULT_CURRENCY,
       description: "Minor Stripe processing fee delta ($14.50) reported on statement batch #ST-20261005 awaiting COGS ledger adjustment",
       status: "unresolved",
       assignedTo: "Finance / Accounts Desk",
-      detectedAt: "2026-10-07 08:00:00"
+      detectedAt: "2026-10-05 18:22:00"
     });
   }
-  // Authoritative Double-Entry Journal Posting with Debit=Credit Verification
+  // ----- core posting ------------------------------------------------------
+  // Posts a balanced journal and applies the resulting wallet-balance effects atomically.
+  // Wallet availableBalance is ONLY ever changed here, so the ledger is the single source of truth.
+  // A repeated idempotencyKey returns the original journal and applies nothing.
   postJournal(params) {
+    if (!params.idempotencyKey) throw new Error("An idempotency key is required for every journal.");
     if (this.idempotencyKeys.has(params.idempotencyKey)) {
       const existing = this.journals.find((j) => j.idempotencyKey === params.idempotencyKey);
       if (existing) return existing;
@@ -68864,15 +68886,13 @@ var FinanceLedgerEngine = class _FinanceLedgerEngine {
     let totalCredit = 0;
     const currencies = /* @__PURE__ */ new Set();
     for (const e2 of params.entries) {
+      if (!Number.isFinite(e2.debit) || !Number.isFinite(e2.credit)) throw new Error("Debits and credits must be finite numbers.");
+      if (e2.debit < 0 || e2.credit < 0) throw new Error("Debits and credits must be non-negative values.");
+      if (e2.debit > 0 && e2.credit > 0) throw new Error("An individual ledger entry cannot have both a debit and credit simultaneously.");
+      if (!CHART_OF_ACCOUNTS.some((c) => c.code === e2.accountCode)) throw new Error(`Unknown account code ${e2.accountCode}`);
       currencies.add(e2.currency);
       totalDebit = _FinanceLedgerEngine.round(totalDebit + e2.debit);
       totalCredit = _FinanceLedgerEngine.round(totalCredit + e2.credit);
-      if (e2.debit < 0 || e2.credit < 0) {
-        throw new Error("Debits and credits must be non-negative values.");
-      }
-      if (e2.debit > 0 && e2.credit > 0) {
-        throw new Error("An individual ledger entry cannot have both a debit and credit simultaneously.");
-      }
     }
     if (currencies.size > 1) {
       throw new Error("Cannot balance journal across mixed currencies. Multi-currency transactions must be posted with currency isolation.");
@@ -68881,15 +68901,28 @@ var FinanceLedgerEngine = class _FinanceLedgerEngine {
     if (difference !== 0) {
       throw new Error(`Journal is out of balance! Total Debits ($${totalDebit.toFixed(2)}) must equal Total Credits ($${totalCredit.toFixed(2)}). Discrepancy: $${difference.toFixed(2)}`);
     }
-    const journalId = `JRN-${Date.now()}-${Math.floor(Math.random() * 900 + 100)}`;
-    const nowIso = params.timestamp || (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").substring(0, 19);
+    const deltas = /* @__PURE__ */ new Map();
+    for (const e2 of params.entries) {
+      if (e2.userId && (e2.accountCode === "2010" || e2.accountCode === "2020")) {
+        deltas.set(e2.userId, _FinanceLedgerEngine.round((deltas.get(e2.userId) || 0) + e2.credit - e2.debit));
+      }
+    }
+    for (const [uid, delta] of deltas) {
+      const w = this.wallets.get(uid);
+      if (!w) throw new Error(`Wallet not found for user ${uid}`);
+      if (_FinanceLedgerEngine.round(w.availableBalance + delta) < 0) {
+        throw new Error(`Insufficient available balance for ${w.userName}: this posting would overdraw the wallet ($${w.availableBalance.toFixed(2)} available).`);
+      }
+    }
+    const journalId = `JRN-${randomUUID()}`;
+    const nowIso = params.timestamp || nowStr();
     const ledgerEntries = params.entries.map((e2, idx) => {
       const coa = CHART_OF_ACCOUNTS.find((c) => c.code === e2.accountCode);
       return {
-        id: `ENT-${journalId}-${idx + 1}`,
+        id: `ENT-${journalId.replace("JRN-", "")}-${idx + 1}`,
         journalId,
         accountCode: e2.accountCode,
-        accountName: e2.accountName || coa?.name || `Account ${e2.accountCode}`,
+        accountName: e2.accountName || coa?.name || "General Ledger Account",
         debit: _FinanceLedgerEngine.round(e2.debit),
         credit: _FinanceLedgerEngine.round(e2.credit),
         currency: e2.currency,
@@ -68902,7 +68935,7 @@ var FinanceLedgerEngine = class _FinanceLedgerEngine {
     const journal = {
       id: journalId,
       reference: params.reference,
-      postingDate: nowIso.substring(0, 10),
+      postingDate: nowIso.split(" ")[0],
       timestamp: nowIso,
       description: params.description,
       eventType: params.eventType,
@@ -68916,103 +68949,124 @@ var FinanceLedgerEngine = class _FinanceLedgerEngine {
     };
     this.journals.unshift(journal);
     this.idempotencyKeys.add(params.idempotencyKey);
+    for (const [uid, delta] of deltas) {
+      const w = this.wallets.get(uid);
+      w.availableBalance = _FinanceLedgerEngine.round(w.availableBalance + delta);
+      w.lastActivityAt = nowIso;
+    }
     const primaryEntry = ledgerEntries.find((e2) => e2.userId) || ledgerEntries[0];
-    let txnType = "deposit";
-    if (params.eventType === "ORDER_ESCROW_FUNDED") txnType = "escrow_fund";
-    else if (params.eventType === "ESCROW_RELEASED_TO_FREELANCER") txnType = "escrow_release";
-    else if (params.eventType === "ESCROW_REFUNDED_TO_BUYER") txnType = "refund";
-    else if (params.eventType === "PAYOUT_REQUESTED") txnType = "payout_requested";
-    else if (params.eventType === "PAYOUT_SETTLED") txnType = "payout_processed";
-    else if (params.eventType === "PAYOUT_CANCELLED") txnType = "payout_cancelled";
-    else if (params.eventType === "ADMIN_ADJUSTMENT_CREDIT") txnType = "adjustment_credit";
-    else if (params.eventType === "ADMIN_ADJUSTMENT_DEBIT") txnType = "adjustment_debit";
+    const typeMap = {
+      DEPOSIT_SETTLED: "deposit",
+      ORDER_ESCROW_FUNDED: "escrow_fund",
+      ESCROW_RELEASED_TO_FREELANCER: "escrow_release",
+      ESCROW_REFUNDED_TO_BUYER: "refund",
+      PAYOUT_REQUESTED: "payout_requested",
+      PAYOUT_SETTLED: "payout_processed",
+      PAYOUT_CANCELLED: "payout_cancelled",
+      PAYOUT_FAILED: "payout_failed",
+      ADMIN_ADJUSTMENT_CREDIT: "adjustment_credit",
+      OPENING_BALANCE: "adjustment_credit",
+      ADMIN_ADJUSTMENT_DEBIT: "adjustment_debit"
+    };
     const affectedUser = primaryEntry?.userId ? this.wallets.get(primaryEntry.userId) : void 0;
     this.transactions.unshift({
       id: `TXN-${journalId.replace("JRN-", "")}`,
-      type: txnType,
+      type: typeMap[params.eventType] || "adjustment_debit",
       amount: totalDebit,
-      currency: Array.from(currencies)[0] || "USD",
+      currency: Array.from(currencies)[0] || DEFAULT_CURRENCY,
       timestamp: nowIso,
       status: "completed",
       userId: affectedUser?.userId || "system",
-      userName: affectedUser?.userName || "Platform System / Escrow",
+      userName: affectedUser?.userName || "Platform System",
       userRole: affectedUser?.userRole || "admin",
       relatedOrderId: primaryEntry?.orderId,
       relatedPayoutId: primaryEntry?.payoutId,
-      providerReference: params.reference,
-      journalId: journal.id,
+      journalId,
       description: params.description
     });
     return journal;
   }
-  // Reverse an existing journal with an atomic linked reversal journal
+  // Reversal is limited to events that have no side state (deposits, adjustments).
+  // Escrow and payout events must be unwound through their own refund / cancel flows.
   reverseJournal(journalId, reason, actor) {
+    const why = _FinanceLedgerEngine.assertReason(reason, "A reversal reason");
     const original = this.journals.find((j) => j.id === journalId);
     if (!original) throw new Error(`Journal ${journalId} not found`);
     if (original.status === "reversed") throw new Error(`Journal ${journalId} has already been reversed by ${original.reversedByJournalId}`);
-    const reversalEntries = original.entries.map((e2) => ({
-      accountCode: e2.accountCode,
-      accountName: e2.accountName,
-      debit: e2.credit,
-      // Invert Debit and Credit
-      credit: e2.debit,
-      currency: e2.currency,
-      description: `Reversal of [${e2.description}]: ${reason}`,
-      userId: e2.userId,
-      orderId: e2.orderId,
-      payoutId: e2.payoutId
-    }));
+    if (original.eventType === "REVERSAL") throw new Error("A reversal journal cannot itself be reversed; post a new correcting entry instead.");
+    const reversible = ["DEPOSIT_SETTLED", "ADMIN_ADJUSTMENT_CREDIT", "ADMIN_ADJUSTMENT_DEBIT"];
+    if (!reversible.includes(original.eventType)) {
+      throw new Error(`Journals of type ${original.eventType} cannot be reversed directly. Use the escrow refund or payout cancel workflow.`);
+    }
     const reversalJournal = this.postJournal({
       reference: `REV-${original.id}`,
-      description: `Reversal of Journal #${original.id}: ${reason}`,
+      description: `Reversal of Journal #${original.id}: ${why}`,
       eventType: "REVERSAL",
-      idempotencyKey: `IDEMP-REV-${original.id}-${Date.now()}`,
+      idempotencyKey: `IDEMP-REV-${original.id}`,
       actor,
-      entries: reversalEntries,
-      notes: reason
+      entries: original.entries.map((e2) => ({
+        accountCode: e2.accountCode,
+        accountName: e2.accountName,
+        debit: e2.credit,
+        credit: e2.debit,
+        currency: e2.currency,
+        description: `Reversal of [${e2.description}]: ${why}`,
+        userId: e2.userId,
+        orderId: e2.orderId,
+        payoutId: e2.payoutId
+      })),
+      notes: why
     });
     original.status = "reversed";
     original.reversedByJournalId = reversalJournal.id;
     reversalJournal.reversalOfJournalId = original.id;
-    this.auditLogs.unshift({
-      id: `FAUD-${Date.now()}`,
-      actor,
-      role: "super_admin",
-      action: "JOURNAL_REVERSED",
-      target: `Journal #${original.id}`,
-      reason,
-      journalId: reversalJournal.id,
-      timestamp: (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").substring(0, 19)
-    });
+    this.audit({ actor, action: "JOURNAL_REVERSED", target: `Journal #${original.id}`, reason: why, journalId: reversalJournal.id });
     return reversalJournal;
   }
-  // Calculate Authoritative Ledger-Derived Balance for a user by summing all debits and credits posted to accounts 2010 (Buyer) or 2020 (Freelancer)
+  // ----- balances & wallets -------------------------------------------------
   calculateLedgerDerivedBalance(userId) {
     let balance = 0;
     for (const journal of this.journals) {
       for (const entry of journal.entries) {
-        if (entry.userId === userId) {
-          if (entry.accountCode === "2010" || entry.accountCode === "2020") {
-            balance = _FinanceLedgerEngine.round(balance + entry.credit - entry.debit);
-          }
+        if (entry.userId === userId && (entry.accountCode === "2010" || entry.accountCode === "2020")) {
+          balance = _FinanceLedgerEngine.round(balance + entry.credit - entry.debit);
         }
       }
     }
     return balance;
   }
-  // Get All Wallets with verified ledger reconciliation
   getWallets() {
-    const list = Array.from(this.wallets.values());
-    return list.map((w) => {
+    return Array.from(this.wallets.values()).map((w) => {
       const ledgerDerived = this.calculateLedgerDerivedBalance(w.userId);
       const difference = _FinanceLedgerEngine.round(Math.abs(w.availableBalance - ledgerDerived));
-      return {
-        ...w,
-        ledgerDerivedBalance: ledgerDerived,
-        isReconciled: difference === 0,
-        discrepancy: difference
-      };
+      return { ...w, ledgerDerivedBalance: ledgerDerived, isReconciled: difference === 0, discrepancy: difference };
     });
+  }
+  getWalletBalance(userId) {
+    return this.wallets.get(userId)?.availableBalance ?? null;
+  }
+  // Opens a zero-balance wallet for a newly registered user (no-op if it already exists).
+  ensureWallet(params) {
+    if (this.wallets.has(params.userId)) return;
+    const now = nowStr();
+    this.wallets.set(params.userId, {
+      id: `WAL-${params.userId.toUpperCase()}`,
+      userId: params.userId,
+      userName: params.name,
+      userEmail: params.email,
+      userRole: params.role,
+      currency: DEFAULT_CURRENCY,
+      availableBalance: 0,
+      pendingIncoming: 0,
+      fundsOnHold: 0,
+      pendingWithdrawals: 0,
+      status: "active",
+      lastActivityAt: now,
+      createdAt: now
+    });
+  }
+  hasWallet(userId) {
+    return this.wallets.has(userId);
   }
   getWalletById(userId) {
     const wallet = this.wallets.get(userId);
@@ -69025,142 +69079,360 @@ var FinanceLedgerEngine = class _FinanceLedgerEngine {
       wallet: {
         ...wallet,
         ledgerDerivedBalance: ledgerDerived,
-        isReconciled: Math.abs(wallet.availableBalance - ledgerDerived) === 0,
+        isReconciled: _FinanceLedgerEngine.round(Math.abs(wallet.availableBalance - ledgerDerived)) === 0,
         discrepancy: _FinanceLedgerEngine.round(Math.abs(wallet.availableBalance - ledgerDerived))
       },
       transactions: userTransactions,
       ledgerEntries: userEntries,
-      auditHistory: userAudits
+      auditLogs: userAudits
     };
   }
-  // Wallet Security Actions
+  // True if the user has any money or open obligation tied to the platform (used to block account deletion)
+  hasOutstandingFunds(userId) {
+    const w = this.wallets.get(userId);
+    if (!w) return false;
+    if (w.availableBalance > 0 || w.fundsOnHold > 0 || w.pendingWithdrawals > 0) return true;
+    for (const e2 of this.escrows.values()) {
+      if (e2.status === "held" && (e2.buyerId === userId || e2.sellerId === userId)) return true;
+    }
+    return false;
+  }
   freezeWallet(userId, reason, actor) {
-    const wallet = this.wallets.get(userId);
-    if (!wallet) throw new Error("Wallet not found");
+    const why = _FinanceLedgerEngine.assertReason(reason, "A reason");
+    const wallet = this.requireWallet(userId);
     wallet.status = "frozen";
-    wallet.restrictionReason = reason;
-    this.auditLogs.unshift({
-      id: `FAUD-${Date.now()}`,
-      actor,
-      role: "super_admin",
-      action: "WALLET_FROZEN",
-      target: `Wallet #${wallet.id} (${wallet.userName})`,
-      reason,
-      timestamp: (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").substring(0, 19)
-    });
+    wallet.restrictionReason = why;
+    this.audit({ actor, action: "WALLET_FROZEN", target: `Wallet #${wallet.id} (${wallet.userName})`, reason: why });
     return wallet;
   }
   unfreezeWallet(userId, reason, actor) {
-    const wallet = this.wallets.get(userId);
-    if (!wallet) throw new Error("Wallet not found");
+    const wallet = this.requireWallet(userId);
     wallet.status = "active";
     wallet.restrictionReason = void 0;
-    this.auditLogs.unshift({
-      id: `FAUD-${Date.now()}`,
-      actor,
-      role: "super_admin",
-      action: "WALLET_UNFROZEN",
-      target: `Wallet #${wallet.id} (${wallet.userName})`,
-      reason,
-      timestamp: (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").substring(0, 19)
-    });
+    this.audit({ actor, action: "WALLET_UNFROZEN", target: `Wallet #${wallet.id} (${wallet.userName})`, reason: reason || "Administrative review completed" });
     return wallet;
   }
   restrictWallet(userId, reason, actor) {
-    const wallet = this.wallets.get(userId);
-    if (!wallet) throw new Error("Wallet not found");
+    const why = _FinanceLedgerEngine.assertReason(reason, "A reason");
+    const wallet = this.requireWallet(userId);
     wallet.status = "restricted";
-    wallet.restrictionReason = reason;
-    this.auditLogs.unshift({
-      id: `FAUD-${Date.now()}`,
-      actor,
-      role: "super_admin",
-      action: "WALLET_WITHDRAWALS_RESTRICTED",
-      target: `Wallet #${wallet.id} (${wallet.userName})`,
-      reason,
-      timestamp: (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").substring(0, 19)
-    });
+    wallet.restrictionReason = why;
+    this.audit({ actor, action: "WALLET_WITHDRAWALS_RESTRICTED", target: `Wallet #${wallet.id} (${wallet.userName})`, reason: why });
     return wallet;
   }
-  // Controlled Administrative Adjustment Workflow: Generates a balanced double-entry journal
+  // ----- deposits ----------------------------------------------------------
+  // Single entry point for money coming in. A payment-gateway webhook should call this with the
+  // gateway's event/payment id as idempotencyKey; replays are harmless.
+  creditDeposit(params) {
+    const amount = _FinanceLedgerEngine.assertMoney(params.amount, "Deposit amount");
+    const wallet = this.requireWallet(params.userId);
+    if (wallet.userRole === "admin") throw new Error("Deposits to admin wallets are not allowed.");
+    if (wallet.status === "frozen") throw new Error("This wallet is frozen; deposits are blocked.");
+    const key = `DEP-${params.idempotencyKey}`;
+    const replayed = this.idempotencyKeys.has(key);
+    const journal = this.postJournal({
+      reference: params.reference,
+      description: `Deposit (${params.source || "gateway"}) - ${wallet.userName}`,
+      eventType: "DEPOSIT_SETTLED",
+      idempotencyKey: key,
+      actor: params.actor,
+      entries: [
+        { accountCode: "1020", debit: amount, credit: 0, currency: DEFAULT_CURRENCY, description: "Payment processor clearing - deposit received", userId: wallet.userId },
+        { accountCode: this.walletAccount(wallet), debit: 0, credit: amount, currency: DEFAULT_CURRENCY, description: `Credited ${wallet.userName} available wallet`, userId: wallet.userId }
+      ]
+    });
+    if (!replayed) this.audit({ actor: params.actor, role: "system", action: "DEPOSIT_CONFIRMED", target: `Wallet #${wallet.id}`, reason: `${params.source || "gateway"} ref ${params.reference}`, journalId: journal.id });
+    return { journal, replayed };
+  }
+  // ----- escrow ------------------------------------------------------------
+  getEscrow(orderId) {
+    return this.escrows.get(orderId);
+  }
+  getEscrows() {
+    return Array.from(this.escrows.values());
+  }
+  // Locks buyer wallet funds in escrow for an order. Fails if the buyer cannot afford it.
+  fundEscrow(params) {
+    if (!params.orderId) throw new Error("orderId is required.");
+    if (this.escrows.has(params.orderId)) throw new Error(`Order ${params.orderId} is already funded.`);
+    const amount = _FinanceLedgerEngine.assertMoney(params.amount, "Order amount");
+    if (!params.skipMinimum && amount < this.minimumOrderAmount) throw new Error(`Minimum order amount is $${this.minimumOrderAmount.toFixed(2)}.`);
+    if (params.buyerId === params.sellerId) throw new Error("A user cannot place an order with themselves.");
+    const buyer = this.requireWallet(params.buyerId);
+    const seller = this.requireWallet(params.sellerId);
+    if (buyer.userRole === "admin" || seller.userRole === "admin") throw new Error("Admin wallets cannot take part in orders.");
+    if (buyer.status === "frozen") throw new Error("Buyer wallet is frozen.");
+    if (seller.status === "frozen") throw new Error("Seller wallet is frozen.");
+    if (buyer.availableBalance < amount) {
+      throw new Error(`Insufficient wallet balance. Available $${buyer.availableBalance.toFixed(2)}, required $${amount.toFixed(2)}. Please add funds.`);
+    }
+    const journal = this.postJournal({
+      reference: `ORD-${params.orderId}-ESCROW-LOCK`,
+      description: `Escrow funding for Order #${params.orderId} (${params.orderTitle})`,
+      eventType: "ORDER_ESCROW_FUNDED",
+      idempotencyKey: `IDEMP-ORD-FUND-${params.orderId}`,
+      actor: params.actor,
+      timestamp: params.timestamp,
+      entries: [
+        { accountCode: this.walletAccount(buyer), debit: amount, credit: 0, currency: DEFAULT_CURRENCY, description: "Debited buyer wallet for order escrow funding", userId: buyer.userId, orderId: params.orderId },
+        { accountCode: "2030", debit: 0, credit: amount, currency: DEFAULT_CURRENCY, description: "Locked in escrow protection vault", orderId: params.orderId }
+      ]
+    });
+    buyer.fundsOnHold = _FinanceLedgerEngine.round(buyer.fundsOnHold + amount);
+    this.escrows.set(params.orderId, {
+      orderId: params.orderId,
+      orderTitle: params.orderTitle,
+      buyerId: buyer.userId,
+      sellerId: seller.userId,
+      amount,
+      remaining: amount,
+      refundedTotal: 0,
+      releasedGross: 0,
+      refundSeq: 0,
+      status: "held",
+      fundedAt: params.timestamp || nowStr()
+    });
+    this.audit({ actor: params.actor, role: "system", action: "ESCROW_FUNDS_LOCKED", target: `Order #${params.orderId}`, reason: `Locked $${amount.toFixed(2)} from buyer wallet`, journalId: journal.id });
+    return { journal, escrow: this.escrows.get(params.orderId) };
+  }
+  // Releases everything still held for the order: net to seller, commission to the platform.
+  // Can only succeed once per order; repeat calls throw and change nothing.
+  releaseEscrow(params) {
+    const cached = this.replay(params.requestKey);
+    if (cached) return cached;
+    const esc = this.escrows.get(params.orderId);
+    if (!esc) throw new Error(`No funded escrow exists for order ${params.orderId}.`);
+    if (esc.status !== "held" || esc.remaining <= 0) throw new Error(`Escrow for order ${params.orderId} is already ${esc.status}; nothing left to release.`);
+    const seller = this.requireWallet(esc.sellerId);
+    if (seller.status === "frozen") throw new Error("Seller wallet is frozen; release blocked until it is unfrozen.");
+    const buyer = this.wallets.get(esc.buyerId);
+    const grossCents = Math.round(esc.remaining * 100);
+    const feeCents = Math.round(grossCents * this.platformCommissionRate / 100);
+    const gross = grossCents / 100;
+    const platformFee = feeCents / 100;
+    const freelancerNet = (grossCents - feeCents) / 100;
+    const entries = [
+      { accountCode: "2030", debit: gross, credit: 0, currency: DEFAULT_CURRENCY, description: `Released funds held in escrow for Order #${params.orderId}`, orderId: params.orderId },
+      { accountCode: this.walletAccount(seller), debit: 0, credit: freelancerNet, currency: DEFAULT_CURRENCY, description: `Credited net earnings to ${seller.userName} (after ${this.platformCommissionRate}% commission)`, userId: seller.userId, orderId: params.orderId }
+    ];
+    if (platformFee > 0) {
+      entries.push({ accountCode: "4010", debit: 0, credit: platformFee, currency: DEFAULT_CURRENCY, description: `${this.platformCommissionRate}% platform commission on Order #${params.orderId}`, orderId: params.orderId });
+    }
+    const journal = this.postJournal({
+      reference: `ORD-${params.orderId}-RELEASE`,
+      description: `Escrow release for Order #${params.orderId} (${esc.orderTitle})`,
+      eventType: "ESCROW_RELEASED_TO_FREELANCER",
+      idempotencyKey: `IDEMP-REL-${params.orderId}`,
+      actor: params.actor,
+      entries
+    });
+    if (buyer) buyer.fundsOnHold = _FinanceLedgerEngine.round(Math.max(0, buyer.fundsOnHold - gross));
+    esc.releasedGross = _FinanceLedgerEngine.round(esc.releasedGross + gross);
+    esc.remaining = 0;
+    esc.status = esc.refundedTotal > 0 ? "split" : "released";
+    this.audit({ actor: params.actor, action: "ESCROW_RELEASED", target: `Order #${params.orderId}`, reason: params.reason || `Released $${freelancerNet.toFixed(2)} net to freelancer, $${platformFee.toFixed(2)} platform commission`, journalId: journal.id });
+    return this.remember(params.requestKey, { journal, freelancerNet, platformFee });
+  }
+  // Refunds all (default) or part of what is still held back to the buyer wallet.
+  refundEscrow(params) {
+    const cached = this.replay(params.requestKey);
+    if (cached) return cached;
+    const why = _FinanceLedgerEngine.assertReason(params.reason, "A refund reason");
+    const esc = this.escrows.get(params.orderId);
+    if (!esc) throw new Error(`No funded escrow exists for order ${params.orderId}.`);
+    if (esc.status !== "held" || esc.remaining <= 0) throw new Error(`Escrow for order ${params.orderId} is already ${esc.status}; nothing left to refund.`);
+    const amount = params.amount === void 0 ? esc.remaining : _FinanceLedgerEngine.assertMoney(params.amount, "Refund amount");
+    if (amount > esc.remaining) throw new Error(`Refund ($${amount.toFixed(2)}) exceeds the escrow still held ($${esc.remaining.toFixed(2)}).`);
+    const buyer = this.requireWallet(esc.buyerId);
+    if (buyer.status === "frozen") throw new Error("Buyer wallet is frozen; refund blocked until it is unfrozen.");
+    const journal = this.postJournal({
+      reference: `ORD-${params.orderId}-REFUND-${esc.refundSeq + 1}`,
+      description: `Escrow refund to Buyer for Order #${params.orderId} (${esc.orderTitle}): ${why}`,
+      eventType: "ESCROW_REFUNDED_TO_BUYER",
+      idempotencyKey: `IDEMP-REF-${params.orderId}-${esc.refundSeq + 1}`,
+      actor: params.actor,
+      entries: [
+        { accountCode: "2030", debit: amount, credit: 0, currency: DEFAULT_CURRENCY, description: `Debited escrow liability for refunded Order #${params.orderId}`, orderId: params.orderId },
+        { accountCode: this.walletAccount(buyer), debit: 0, credit: amount, currency: DEFAULT_CURRENCY, description: `Restored available wallet balance for ${buyer.userName}`, userId: buyer.userId, orderId: params.orderId }
+      ]
+    });
+    buyer.fundsOnHold = _FinanceLedgerEngine.round(Math.max(0, buyer.fundsOnHold - amount));
+    esc.remaining = _FinanceLedgerEngine.round(esc.remaining - amount);
+    esc.refundedTotal = _FinanceLedgerEngine.round(esc.refundedTotal + amount);
+    esc.refundSeq += 1;
+    if (esc.remaining === 0) esc.status = "refunded";
+    this.audit({ actor: params.actor, action: "ESCROW_REFUNDED", target: `Order #${params.orderId}`, reason: why, journalId: journal.id });
+    return this.remember(params.requestKey, { journal, buyerWallet: buyer, refunded: amount, remaining: esc.remaining });
+  }
+  // Dispute split: refund `refundAmount` to the buyer and release the rest to the seller.
+  resolveEscrowSplit(params) {
+    const why = _FinanceLedgerEngine.assertReason(params.reason, "A resolution reason");
+    const esc = this.escrows.get(params.orderId);
+    if (!esc) throw new Error(`No funded escrow exists for order ${params.orderId}.`);
+    if (esc.status !== "held") throw new Error(`Escrow for order ${params.orderId} is already ${esc.status}.`);
+    const refund = _FinanceLedgerEngine.assertMoney(params.refundAmount, "Refund amount");
+    if (refund >= esc.remaining) throw new Error("For a split, the refund must be less than the escrow held. Use a full refund instead.");
+    if (this.requireWallet(esc.buyerId).status === "frozen") throw new Error("Buyer wallet is frozen.");
+    if (this.requireWallet(esc.sellerId).status === "frozen") throw new Error("Seller wallet is frozen.");
+    const refundResult = this.refundEscrow({ orderId: params.orderId, amount: refund, reason: why, actor: params.actor });
+    const releaseResult = this.releaseEscrow({ orderId: params.orderId, actor: params.actor, reason: `Remainder released after $${refund.toFixed(2)} refund: ${why}` });
+    return { refund: refundResult, release: releaseResult };
+  }
+  // ----- payouts -----------------------------------------------------------
+  getPayoutRecord(id) {
+    return this.payouts.get(id);
+  }
+  // Withdrawal request: moves money from the wallet into "pending payout" so it cannot be spent twice.
+  requestPayout(params) {
+    if (this.payouts.has(params.payoutId)) throw new Error(`Payout ${params.payoutId} already exists.`);
+    const amount = _FinanceLedgerEngine.assertMoney(params.amount, "Withdrawal amount");
+    const wallet = this.requireWallet(params.freelancerId);
+    if (wallet.userRole === "admin") throw new Error("Admin wallets cannot withdraw.");
+    if (wallet.status !== "active") throw new Error(`Withdrawals are blocked: wallet is ${wallet.status}.`);
+    if (amount < this.minimumWithdrawalAmount) throw new Error(`Minimum withdrawal is $${this.minimumWithdrawalAmount.toFixed(2)}.`);
+    if (amount > this.maximumWithdrawalAmount) throw new Error(`Maximum withdrawal per request is $${this.maximumWithdrawalAmount.toFixed(2)}.`);
+    if (wallet.availableBalance < amount) throw new Error(`Insufficient available balance ($${wallet.availableBalance.toFixed(2)}).`);
+    if (!params.accountDetails || String(params.accountDetails).trim().length < 3) throw new Error("Payout account details are required.");
+    const journal = this.postJournal({
+      reference: `PAY-${params.payoutId}-REQUESTED`,
+      description: `Withdrawal requested #${params.payoutId} via ${params.method}`,
+      eventType: "PAYOUT_REQUESTED",
+      idempotencyKey: `IDEMP-PAYREQ-${params.payoutId}-1`,
+      actor: params.actor,
+      entries: [
+        { accountCode: this.walletAccount(wallet), debit: amount, credit: 0, currency: DEFAULT_CURRENCY, description: "Debited wallet for withdrawal request", userId: wallet.userId, payoutId: params.payoutId },
+        { accountCode: "2040", debit: 0, credit: amount, currency: DEFAULT_CURRENCY, description: "Pending payout liability", payoutId: params.payoutId }
+      ]
+    });
+    wallet.pendingWithdrawals = _FinanceLedgerEngine.round(wallet.pendingWithdrawals + amount);
+    const rec = { id: params.payoutId, freelancerId: wallet.userId, amount, method: params.method, accountDetails: String(params.accountDetails), status: "requested", attempt: 1 };
+    this.payouts.set(params.payoutId, rec);
+    this.audit({ actor: params.actor, role: "user", action: "PAYOUT_REQUESTED", target: `Payout #${params.payoutId}`, reason: `$${amount.toFixed(2)} via ${params.method}`, journalId: journal.id });
+    return { journal, payout: rec };
+  }
+  // Marks the money as sent. Call this after the gateway confirms the transfer.
+  settlePayout(params) {
+    const rec = this.payouts.get(params.payoutId);
+    if (!rec) throw new Error(`Payout ${params.payoutId} not found.`);
+    if (rec.status !== "requested") throw new Error(`Cannot settle payout in status "${rec.status}".`);
+    const wallet = this.requireWallet(rec.freelancerId);
+    if (wallet.status === "frozen") throw new Error("Wallet is frozen; payout cannot be settled.");
+    const journal = this.postJournal({
+      reference: params.providerReference || `PAY-${rec.id}-DISBURSED`,
+      description: `Disbursed Payout #${rec.id} via ${rec.method} to ${wallet.userName} (${rec.accountDetails})`,
+      eventType: "PAYOUT_SETTLED",
+      idempotencyKey: `IDEMP-PAYSETTLE-${rec.id}-${rec.attempt}`,
+      actor: params.actor,
+      entries: [
+        { accountCode: "2040", debit: rec.amount, credit: 0, currency: DEFAULT_CURRENCY, description: "Cleared pending payout liability", payoutId: rec.id },
+        { accountCode: "1030", debit: 0, credit: rec.amount, currency: DEFAULT_CURRENCY, description: `Disbursed through ${rec.method}`, payoutId: rec.id }
+      ]
+    });
+    wallet.pendingWithdrawals = _FinanceLedgerEngine.round(Math.max(0, wallet.pendingWithdrawals - rec.amount));
+    rec.status = "settled";
+    this.audit({ actor: params.actor, action: "PAYOUT_SETTLED", target: `Payout #${rec.id}`, reason: `Settled $${rec.amount.toFixed(2)} via ${rec.method}`, journalId: journal.id });
+    return { journal, payout: rec };
+  }
+  returnPayoutFunds(payoutId, reason, actor, finalStatus) {
+    const why = _FinanceLedgerEngine.assertReason(reason, "A reason");
+    const rec = this.payouts.get(payoutId);
+    if (!rec) throw new Error(`Payout ${payoutId} not found.`);
+    if (rec.status !== "requested") throw new Error(`Cannot ${finalStatus === "failed" ? "fail" : "cancel"} payout in status "${rec.status}".`);
+    const wallet = this.requireWallet(rec.freelancerId);
+    const journal = this.postJournal({
+      reference: `PAY-${rec.id}-${finalStatus.toUpperCase()}-${rec.attempt}`,
+      description: `Payout #${rec.id} ${finalStatus}; funds returned to wallet: ${why}`,
+      eventType: finalStatus === "failed" ? "PAYOUT_FAILED" : "PAYOUT_CANCELLED",
+      idempotencyKey: `IDEMP-PAYRETURN-${rec.id}-${rec.attempt}`,
+      actor,
+      entries: [
+        { accountCode: "2040", debit: rec.amount, credit: 0, currency: DEFAULT_CURRENCY, description: "Released pending payout liability", payoutId: rec.id },
+        { accountCode: this.walletAccount(wallet), debit: 0, credit: rec.amount, currency: DEFAULT_CURRENCY, description: `Restored balance to ${wallet.userName}`, userId: wallet.userId, payoutId: rec.id }
+      ]
+    });
+    wallet.pendingWithdrawals = _FinanceLedgerEngine.round(Math.max(0, wallet.pendingWithdrawals - rec.amount));
+    rec.status = finalStatus;
+    this.audit({ actor, action: finalStatus === "failed" ? "PAYOUT_FAILED_REFUNDED" : "PAYOUT_CANCELLED_REFUNDED", target: `Payout #${rec.id}`, reason: why, journalId: journal.id });
+    return { journal, wallet, payout: rec };
+  }
+  cancelPayout(params) {
+    return this.returnPayoutFunds(params.payoutId, params.reason, params.actor, "cancelled");
+  }
+  failPayout(params) {
+    return this.returnPayoutFunds(params.payoutId, params.reason, params.actor, "failed");
+  }
+  // Re-queues a failed payout: the funds are debited again (and must still be available).
+  retryPayout(params) {
+    const rec = this.payouts.get(params.payoutId);
+    if (!rec) throw new Error(`Payout ${params.payoutId} not found.`);
+    if (rec.status !== "failed") throw new Error("Only failed payouts can be retried.");
+    const wallet = this.requireWallet(rec.freelancerId);
+    if (wallet.status !== "active") throw new Error(`Withdrawals are blocked: wallet is ${wallet.status}.`);
+    if (wallet.availableBalance < rec.amount) throw new Error(`Insufficient available balance ($${wallet.availableBalance.toFixed(2)}) to retry this payout.`);
+    const nextAttempt = rec.attempt + 1;
+    const journal = this.postJournal({
+      reference: `PAY-${rec.id}-REQUESTED-${nextAttempt}`,
+      description: `Withdrawal re-queued #${rec.id} (attempt ${nextAttempt})`,
+      eventType: "PAYOUT_REQUESTED",
+      idempotencyKey: `IDEMP-PAYREQ-${rec.id}-${nextAttempt}`,
+      actor: params.actor,
+      entries: [
+        { accountCode: this.walletAccount(wallet), debit: rec.amount, credit: 0, currency: DEFAULT_CURRENCY, description: "Debited wallet for retried withdrawal", userId: wallet.userId, payoutId: rec.id },
+        { accountCode: "2040", debit: 0, credit: rec.amount, currency: DEFAULT_CURRENCY, description: "Pending payout liability", payoutId: rec.id }
+      ]
+    });
+    wallet.pendingWithdrawals = _FinanceLedgerEngine.round(wallet.pendingWithdrawals + rec.amount);
+    rec.attempt = nextAttempt;
+    rec.status = "requested";
+    this.audit({ actor: params.actor, action: "PAYOUT_RETRIED", target: `Payout #${rec.id}`, reason: `Re-queued $${rec.amount.toFixed(2)} (attempt ${nextAttempt})`, journalId: journal.id });
+    return { journal, payout: rec };
+  }
+  static {
+    // ----- administrative adjustments ----------------------------------------
+    this.ADJUSTMENT_CATEGORIES = ["goodwill", "dispute_resolution", "accounting_correction", "chargeback_recovery"];
+  }
   executeAdministrativeAdjustment(params) {
-    const wallet = this.wallets.get(params.userId);
-    if (!wallet) throw new Error("Wallet not found");
-    if (params.amount <= 0) throw new Error("Adjustment amount must be strictly greater than $0.00");
-    if (!params.reason || params.reason.trim().length < 5) throw new Error("A mandatory explanation (min 5 characters) is required for financial adjustments.");
-    const userAccountCode = wallet.userRole === "buyer" ? "2010" : "2020";
-    const amount = _FinanceLedgerEngine.round(params.amount);
-    let journalEntries;
+    const cached = this.replay(params.requestKey);
+    if (cached) return cached;
+    const wallet = this.requireWallet(params.userId);
+    if (wallet.userRole === "admin") throw new Error("Admin wallets cannot be adjusted.");
+    if (params.direction !== "credit_user" && params.direction !== "debit_user") throw new Error("Invalid adjustment direction.");
+    if (!_FinanceLedgerEngine.ADJUSTMENT_CATEGORIES.includes(params.category)) throw new Error("Invalid adjustment category.");
+    const amount = _FinanceLedgerEngine.assertMoney(params.amount, "Adjustment amount");
+    const why = _FinanceLedgerEngine.assertReason(params.reason, "A mandatory explanation");
+    const acct = this.walletAccount(wallet);
+    let entries;
     if (params.direction === "credit_user") {
-      journalEntries = [
-        {
-          accountCode: "5020",
-          debit: amount,
-          credit: 0,
-          currency: "USD",
-          description: `Adjustment Expense: ${params.category.toUpperCase()} - ${params.reason}`
-        },
-        {
-          accountCode: userAccountCode,
-          debit: 0,
-          credit: amount,
-          currency: "USD",
-          description: `Credit Adjustment to ${wallet.userName} (${wallet.userRole}): ${params.reason}`,
-          userId: wallet.userId
-        }
+      entries = [
+        { accountCode: "5020", debit: amount, credit: 0, currency: DEFAULT_CURRENCY, description: `Adjustment Expense: ${params.category.toUpperCase()} - ${why}` },
+        { accountCode: acct, debit: 0, credit: amount, currency: DEFAULT_CURRENCY, description: `Credit Adjustment to ${wallet.userName} (${wallet.userRole}): ${why}`, userId: wallet.userId }
       ];
-      wallet.availableBalance = _FinanceLedgerEngine.round(wallet.availableBalance + amount);
     } else {
       if (wallet.availableBalance < amount) {
         throw new Error(`Insufficient user available balance ($${wallet.availableBalance.toFixed(2)}) for a debit adjustment of $${amount.toFixed(2)}. Arbitrary negative balances are prohibited.`);
       }
-      journalEntries = [
-        {
-          accountCode: userAccountCode,
-          debit: amount,
-          credit: 0,
-          currency: "USD",
-          description: `Debit Adjustment from ${wallet.userName} (${wallet.userRole}): ${params.reason}`,
-          userId: wallet.userId
-        },
-        {
-          accountCode: "5020",
-          debit: 0,
-          credit: amount,
-          currency: "USD",
-          description: `Expense Recovery: ${params.category.toUpperCase()} - ${params.reason}`
-        }
+      entries = [
+        { accountCode: acct, debit: amount, credit: 0, currency: DEFAULT_CURRENCY, description: `Debit Adjustment from ${wallet.userName} (${wallet.userRole}): ${why}`, userId: wallet.userId },
+        { accountCode: "5020", debit: 0, credit: amount, currency: DEFAULT_CURRENCY, description: `Expense Recovery: ${params.category.toUpperCase()} - ${why}` }
       ];
-      wallet.availableBalance = _FinanceLedgerEngine.round(wallet.availableBalance - amount);
     }
     const journal = this.postJournal({
-      reference: `ADJ-${wallet.id}-${Date.now()}`,
-      description: `Administrative ${params.direction.toUpperCase()}: ${params.reason} (${params.category})`,
+      reference: `ADJ-${wallet.id}-${randomUUID().slice(0, 8)}`,
+      description: `Administrative ${params.direction.toUpperCase()}: ${why} (${params.category})`,
       eventType: params.direction === "credit_user" ? "ADMIN_ADJUSTMENT_CREDIT" : "ADMIN_ADJUSTMENT_DEBIT",
-      idempotencyKey: `IDEMP-ADJ-${wallet.id}-${Date.now()}`,
+      idempotencyKey: `IDEMP-ADJ-${randomUUID()}`,
       actor: params.actor,
-      entries: journalEntries,
-      notes: `Category: ${params.category} | Reference: ${params.evidenceReference || "N/A"} | Reason: ${params.reason}`
+      entries,
+      notes: `Category: ${params.category} | Reference: ${params.evidenceReference || "N/A"} | Reason: ${why}`
     });
-    this.auditLogs.unshift({
-      id: `FAUD-${Date.now()}`,
-      actor: params.actor,
-      role: "super_admin",
-      action: `ADMIN_ADJUSTMENT_${params.direction.toUpperCase()}`,
-      target: `Wallet #${wallet.id} (${wallet.userName})`,
-      reason: `${params.reason} [${params.category}] Amount: $${amount}`,
-      journalId: journal.id,
-      timestamp: (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").substring(0, 19)
-    });
-    return { journal, wallet };
+    this.audit({ actor: params.actor, action: `ADMIN_ADJUSTMENT_${params.direction.toUpperCase()}`, target: `Wallet #${wallet.id} (${wallet.userName})`, reason: `${why} [${params.category}] Amount: $${amount.toFixed(2)}`, journalId: journal.id });
+    return this.remember(params.requestKey, { journal, wallet });
   }
-  // Preview double-entry journal before posting
   previewAdjustment(params) {
-    const wallet = this.wallets.get(params.userId);
-    if (!wallet) throw new Error("Wallet not found");
-    const amount = _FinanceLedgerEngine.round(params.amount || 0);
-    const userAccountCode = wallet.userRole === "buyer" ? "2010" : "2020";
-    const userAccountName = wallet.userRole === "buyer" ? "Buyer Wallets Payable" : "Freelancer Wallets Payable";
+    const wallet = this.requireWallet(params.userId);
+    const amount = _FinanceLedgerEngine.assertMoney(params.amount, "Adjustment amount");
+    const userAccountCode = this.walletAccount(wallet);
+    const userAccountName = userAccountCode === "2010" ? "Buyer Wallets Payable" : "Freelancer Wallets Payable";
     if (params.direction === "credit_user") {
       return {
         debits: [{ accountCode: "5020", accountName: "Administrative & Goodwill Adjustments", amount, effect: "Increases platform expense" }],
@@ -69169,343 +69441,32 @@ var FinanceLedgerEngine = class _FinanceLedgerEngine {
         currentBalance: wallet.availableBalance,
         balanced: true
       };
-    } else {
-      return {
-        debits: [{ accountCode: userAccountCode, accountName: userAccountName, amount, effect: `Decreases ${wallet.userName} available balance` }],
-        credits: [{ accountCode: "5020", accountName: "Administrative & Goodwill Adjustments", amount, effect: "Decreases platform expense / recovery" }],
-        resultingBalance: _FinanceLedgerEngine.round(wallet.availableBalance - amount),
-        currentBalance: wallet.availableBalance,
-        balanced: true,
-        insufficientFunds: wallet.availableBalance < amount
-      };
     }
-  }
-  // Escrow Release Execution: Releases 90% to Freelancer and 10% to Platform Fee Revenue
-  releaseEscrow(params) {
-    const freelancerWallet = this.wallets.get(params.sellerId);
-    const buyerWallet = this.wallets.get(params.buyerId);
-    if (!freelancerWallet) throw new Error("Freelancer wallet not found");
-    const totalAmount = _FinanceLedgerEngine.round(params.amount);
-    const platformFee = _FinanceLedgerEngine.round(totalAmount * 0.1);
-    const freelancerNet = _FinanceLedgerEngine.round(totalAmount - platformFee);
-    const journal = this.postJournal({
-      reference: `ORD-${params.orderId}-RELEASE`,
-      description: `Escrow release for Order #${params.orderId} (${params.orderTitle})`,
-      eventType: "ESCROW_RELEASED_TO_FREELANCER",
-      idempotencyKey: `IDEMP-REL-${params.orderId}`,
-      actor: params.actor,
-      entries: [
-        {
-          accountCode: "2030",
-          accountName: "Marketplace Escrow Funds in Trust",
-          debit: totalAmount,
-          credit: 0,
-          currency: "USD",
-          description: `Released funds held in escrow for Order #${params.orderId}`,
-          orderId: params.orderId
-        },
-        {
-          accountCode: "2020",
-          accountName: "Freelancer Wallets Payable",
-          debit: 0,
-          credit: freelancerNet,
-          currency: "USD",
-          description: `Credited 90% net earnings to freelancer ${freelancerWallet.userName}`,
-          userId: freelancerWallet.userId,
-          orderId: params.orderId
-        },
-        {
-          accountCode: "4010",
-          accountName: "Marketplace Platform Commission Fee",
-          debit: 0,
-          credit: platformFee,
-          currency: "USD",
-          description: `10% Platform commission fee on Order #${params.orderId}`,
-          orderId: params.orderId
-        }
-      ]
-    });
-    freelancerWallet.availableBalance = _FinanceLedgerEngine.round(freelancerWallet.availableBalance + freelancerNet);
-    if (buyerWallet && buyerWallet.fundsOnHold >= totalAmount) {
-      buyerWallet.fundsOnHold = _FinanceLedgerEngine.round(buyerWallet.fundsOnHold - totalAmount);
-    }
-    this.auditLogs.unshift({
-      id: `FAUD-${Date.now()}`,
-      actor: params.actor,
-      role: "super_admin",
-      action: "ESCROW_RELEASED",
-      target: `Order #${params.orderId}`,
-      reason: `Authorized order payout release: $${freelancerNet} net to freelancer, $${platformFee} platform commission`,
-      journalId: journal.id,
-      timestamp: (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").substring(0, 19)
-    });
-    return { journal, freelancerNet, platformFee };
-  }
-  // Escrow Refund Execution: Returns 100% of escrow funds back to Buyer available balance
-  refundEscrow(params) {
-    const buyerWallet = this.wallets.get(params.buyerId);
-    if (!buyerWallet) throw new Error("Buyer wallet not found");
-    const totalAmount = _FinanceLedgerEngine.round(params.amount);
-    const journal = this.postJournal({
-      reference: `ORD-${params.orderId}-REFUND`,
-      description: `Escrow refund to Buyer for Order #${params.orderId} (${params.orderTitle}): ${params.reason}`,
-      eventType: "ESCROW_REFUNDED_TO_BUYER",
-      idempotencyKey: `IDEMP-REF-${params.orderId}-${Date.now()}`,
-      actor: params.actor,
-      entries: [
-        {
-          accountCode: "2030",
-          accountName: "Marketplace Escrow Funds in Trust",
-          debit: totalAmount,
-          credit: 0,
-          currency: "USD",
-          description: `Debited escrow liability for cancelled/refunded Order #${params.orderId}`,
-          orderId: params.orderId
-        },
-        {
-          accountCode: "2010",
-          accountName: "Buyer Wallets Payable",
-          debit: 0,
-          credit: totalAmount,
-          currency: "USD",
-          description: `Restored available wallet balance for buyer ${buyerWallet.userName}`,
-          userId: buyerWallet.userId,
-          orderId: params.orderId
-        }
-      ]
-    });
-    buyerWallet.availableBalance = _FinanceLedgerEngine.round(buyerWallet.availableBalance + totalAmount);
-    if (buyerWallet.fundsOnHold >= totalAmount) {
-      buyerWallet.fundsOnHold = _FinanceLedgerEngine.round(buyerWallet.fundsOnHold - totalAmount);
-    }
-    this.auditLogs.unshift({
-      id: `FAUD-${Date.now()}`,
-      actor: params.actor,
-      role: "super_admin",
-      action: "ESCROW_REFUNDED",
-      target: `Order #${params.orderId}`,
-      reason: params.reason,
-      journalId: journal.id,
-      timestamp: (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").substring(0, 19)
-    });
-    return { journal, buyerWallet };
-  }
-  // Payout Cancellation: Restores withdrawable funds back to freelancer wallet
-  cancelPayout(params) {
-    const wallet = this.wallets.get(params.freelancerId);
-    if (!wallet) throw new Error("Freelancer wallet not found");
-    const amount = _FinanceLedgerEngine.round(params.amount);
-    const journal = this.postJournal({
-      reference: `PAY-${params.payoutId}-CANCELLED`,
-      description: `Cancelled Payout #${params.payoutId} and refunded available balance: ${params.reason}`,
-      eventType: "PAYOUT_CANCELLED",
-      idempotencyKey: `IDEMP-PAY-CANCEL-${params.payoutId}`,
-      actor: params.actor,
-      entries: [
-        {
-          accountCode: "1030",
-          accountName: "Payout Gateway Transit",
-          debit: amount,
-          credit: 0,
-          currency: "USD",
-          description: `Cancelled payout returned from transit`,
-          payoutId: params.payoutId
-        },
-        {
-          accountCode: "2020",
-          accountName: "Freelancer Wallets Payable",
-          debit: 0,
-          credit: amount,
-          currency: "USD",
-          description: `Restored balance to freelancer ${wallet.userName}`,
-          userId: wallet.userId,
-          payoutId: params.payoutId
-        }
-      ]
-    });
-    wallet.availableBalance = _FinanceLedgerEngine.round(wallet.availableBalance + amount);
-    this.auditLogs.unshift({
-      id: `FAUD-${Date.now()}`,
-      actor: params.actor,
-      role: "super_admin",
-      action: "PAYOUT_CANCELLED_REFUNDED",
-      target: `Payout #${params.payoutId}`,
-      reason: params.reason,
-      journalId: journal.id,
-      timestamp: (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").substring(0, 19)
-    });
-    return { journal, wallet };
-  }
-  // Ensure Wallet Exists for any user (buyers, freelancers, admins, new users)
-  ensureWalletExists(user) {
-    let wallet = this.wallets.get(user.id);
-    if (!wallet) {
-      wallet = {
-        id: `WAL-${user.id.toUpperCase()}`,
-        userId: user.id,
-        userName: user.name,
-        userEmail: user.email,
-        userRole: user.role === "buyer" ? "buyer" : user.role === "admin" ? "admin" : "freelancer",
-        currency: "USD",
-        availableBalance: user.initialBalance || 0,
-        pendingIncoming: 0,
-        fundsOnHold: 0,
-        pendingWithdrawals: 0,
-        status: "active",
-        lastActivityAt: (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").substring(0, 19),
-        createdAt: (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").substring(0, 19)
-      };
-      this.wallets.set(user.id, wallet);
-    }
-    return wallet;
-  }
-  // User Deposit Execution: Balanced Double-Entry Entry (Asset Debit, Liability Credit)
-  depositFunds(params) {
-    let wallet = this.wallets.get(params.userId);
-    if (!wallet && params.userName && params.userEmail) {
-      wallet = this.ensureWalletExists({
-        id: params.userId,
-        name: params.userName,
-        email: params.userEmail,
-        role: params.userRole,
-        initialBalance: 0
-      });
-    }
-    if (!wallet) throw new Error("User wallet not found");
-    const amount = _FinanceLedgerEngine.round(params.amount);
-    if (amount <= 0) throw new Error("Deposit amount must be greater than $0.00");
-    const accountCode = wallet.userRole === "freelancer" ? "2020" : "2010";
-    const accountName = wallet.userRole === "freelancer" ? "Freelancer Wallets Payable" : "Buyer Wallets Payable";
-    const journal = this.postJournal({
-      reference: `DEP-${Date.now().toString(36).toUpperCase()}`,
-      description: `User balance top-up: $${amount.toFixed(2)} via ${params.paymentMethod} for ${wallet.userName}`,
-      eventType: "DEPOSIT_SETTLED",
-      idempotencyKey: `IDEMP-DEP-${params.userId}-${Date.now()}`,
-      actor: params.actor || "Payment Processor",
-      entries: [
-        {
-          accountCode: "1020",
-          accountName: "Payment Processor Clearing",
-          debit: amount,
-          credit: 0,
-          currency: "USD",
-          description: `Clearing funds settled from ${params.paymentMethod}`,
-          userId: params.userId
-        },
-        {
-          accountCode,
-          accountName,
-          debit: 0,
-          credit: amount,
-          currency: "USD",
-          description: `Credited available balance for ${wallet.userName}`,
-          userId: params.userId
-        }
-      ]
-    });
-    wallet.availableBalance = _FinanceLedgerEngine.round(wallet.availableBalance + amount);
-    wallet.lastActivityAt = (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").substring(0, 19);
-    const txn = {
-      id: `txn_${Date.now()}`,
-      type: "deposit",
-      amount,
-      currency: "USD",
-      timestamp: (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").substring(0, 19),
-      status: "completed",
-      userId: params.userId,
-      userName: wallet.userName,
-      userRole: wallet.userRole,
-      providerReference: params.providerReference || `PAY-${Date.now()}`,
-      journalId: journal.id,
-      description: `Deposit via ${params.paymentMethod}`
+    return {
+      debits: [{ accountCode: userAccountCode, accountName: userAccountName, amount, effect: `Decreases ${wallet.userName} available balance` }],
+      credits: [{ accountCode: "5020", accountName: "Administrative & Goodwill Adjustments", amount, effect: "Decreases platform expense / recovery" }],
+      resultingBalance: _FinanceLedgerEngine.round(wallet.availableBalance - amount),
+      currentBalance: wallet.availableBalance,
+      balanced: true,
+      insufficientFunds: wallet.availableBalance < amount
     };
-    this.transactions.unshift(txn);
-    return { journal, newBalance: wallet.availableBalance, transaction: txn };
   }
-  // User Payout / Withdrawal Request: Balanced Double-Entry Entry
-  requestPayout(params) {
-    const wallet = this.wallets.get(params.userId);
-    if (!wallet) throw new Error("User wallet not found");
-    const amount = _FinanceLedgerEngine.round(params.amount);
-    if (amount <= 0) throw new Error("Withdrawal amount must be greater than $0.00");
-    if (wallet.availableBalance < amount) {
-      throw new Error(`Insufficient available funds. Available: $${wallet.availableBalance.toFixed(2)}, Requested: $${amount.toFixed(2)}`);
+  // ----- reporting ---------------------------------------------------------
+  accountNet(code) {
+    const coa = CHART_OF_ACCOUNTS.find((c2) => c2.code === code);
+    let d = 0, c = 0;
+    for (const j of this.journals) for (const e2 of j.entries) if (e2.accountCode === code) {
+      d = _FinanceLedgerEngine.round(d + e2.debit);
+      c = _FinanceLedgerEngine.round(c + e2.credit);
     }
-    if (wallet.status !== "active") {
-      throw new Error(`Wallet is ${wallet.status}. Withdrawals are currently disabled for this account.`);
-    }
-    const accountCode = wallet.userRole === "buyer" ? "2010" : "2020";
-    const accountName = wallet.userRole === "buyer" ? "Buyer Wallets Payable" : "Freelancer Wallets Payable";
-    const journal = this.postJournal({
-      reference: `PAYOUT-REQ-${Date.now().toString(36).toUpperCase()}`,
-      description: `Withdrawal request of $${amount.toFixed(2)} via ${params.method} for ${wallet.userName}`,
-      eventType: "PAYOUT_REQUESTED",
-      idempotencyKey: `IDEMP-PAYOUT-${params.userId}-${Date.now()}`,
-      actor: params.actor || wallet.userName,
-      entries: [
-        {
-          accountCode,
-          accountName,
-          debit: amount,
-          credit: 0,
-          currency: "USD",
-          description: `Debited available balance for withdrawal to ${params.method}`,
-          userId: params.userId
-        },
-        {
-          accountCode: "2040",
-          accountName: "Pending Payout Liabilities",
-          debit: 0,
-          credit: amount,
-          currency: "USD",
-          description: `Queued pending payout liability via ${params.method}`,
-          userId: params.userId
-        }
-      ]
-    });
-    wallet.availableBalance = _FinanceLedgerEngine.round(wallet.availableBalance - amount);
-    wallet.pendingWithdrawals = _FinanceLedgerEngine.round(wallet.pendingWithdrawals + amount);
-    wallet.lastActivityAt = (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").substring(0, 19);
-    const txn = {
-      id: `txn_${Date.now()}`,
-      type: "payout_requested",
-      amount,
-      currency: "USD",
-      timestamp: (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").substring(0, 19),
-      status: "pending",
-      userId: params.userId,
-      userName: wallet.userName,
-      userRole: wallet.userRole,
-      journalId: journal.id,
-      description: `Withdrawal to ${params.method} (${params.accountDetails})`
-    };
-    this.transactions.unshift(txn);
-    return { journal, newBalance: wallet.availableBalance, transaction: txn };
+    return _FinanceLedgerEngine.round(coa.normalBalance === "debit" ? d - c : c - d);
   }
-  // Get Authoritative Aggregated Financial Overview
   getFinancialOverview() {
     let totalBuyerLiabilities = 0;
     let totalFreelancerLiabilities = 0;
-    let totalEscrowHeld = 0;
-    let totalPlatformRevenue = 0;
-    let totalPendingPayouts = 0;
     for (const w of this.wallets.values()) {
-      if (w.userRole === "buyer") {
-        totalBuyerLiabilities += w.availableBalance;
-        totalEscrowHeld += w.fundsOnHold;
-      } else if (w.userRole === "freelancer") {
-        totalFreelancerLiabilities += w.availableBalance;
-      }
-    }
-    for (const j of this.journals) {
-      for (const e2 of j.entries) {
-        if (e2.accountCode === "4010") {
-          totalPlatformRevenue += e2.credit - e2.debit;
-        }
-        if (e2.accountCode === "2040") {
-          totalPendingPayouts += e2.credit - e2.debit;
-        }
-      }
+      if (w.userRole === "buyer") totalBuyerLiabilities += w.availableBalance;
+      else if (w.userRole === "freelancer") totalFreelancerLiabilities += w.availableBalance;
     }
     let totalDebits = 0;
     let totalCredits = 0;
@@ -69514,63 +69475,61 @@ var FinanceLedgerEngine = class _FinanceLedgerEngine {
       totalCredits += j.totalCredit;
     }
     const trialBalanceDiff = _FinanceLedgerEngine.round(Math.abs(totalDebits - totalCredits));
+    const escrowHeld = _FinanceLedgerEngine.round(this.getEscrows().filter((e2) => e2.status === "held").reduce((a, e2) => a + e2.remaining, 0));
     return {
       totalUserWalletLiabilities: _FinanceLedgerEngine.round(totalBuyerLiabilities + totalFreelancerLiabilities),
       availableBuyerBalances: _FinanceLedgerEngine.round(totalBuyerLiabilities),
       availableFreelancerBalances: _FinanceLedgerEngine.round(totalFreelancerLiabilities),
-      fundsHeldInEscrow: _FinanceLedgerEngine.round(totalEscrowHeld),
-      pendingPayouts: _FinanceLedgerEngine.round(Math.max(0, totalPendingPayouts)),
-      platformRevenue: _FinanceLedgerEngine.round(totalPlatformRevenue),
+      fundsHeldInEscrow: escrowHeld,
+      pendingPayouts: Math.max(0, this.accountNet("2040")),
+      platformRevenue: this.accountNet("4010"),
       failedTransactionsCount: this.transactions.filter((t2) => t2.status === "failed").length,
       unreconciledExceptionsCount: this.exceptions.filter((e2) => e2.status === "unresolved").length,
       trialBalanceInBalance: trialBalanceDiff === 0,
-      totalLedgerDebits: _FinanceLedgerEngine.round(totalDebits),
-      totalLedgerCredits: _FinanceLedgerEngine.round(totalCredits),
       trialBalanceDiscrepancy: trialBalanceDiff,
-      activeWalletsCount: this.wallets.size,
-      frozenWalletsCount: Array.from(this.wallets.values()).filter((w) => w.status === "frozen").length,
-      restrictedWalletsCount: Array.from(this.wallets.values()).filter((w) => w.status === "restricted").length
+      trialBalanceSum: _FinanceLedgerEngine.round(totalDebits),
+      lastAuditSyncTimestamp: nowStr(),
+      totalJournalsPosted: this.journals.length,
+      totalWalletsCount: this.wallets.size,
+      frozenWalletsCount: Array.from(this.wallets.values()).filter((w) => w.status === "frozen").length
     };
   }
-  // Get Reconciliation Summary
+  // Cross-checks that must always hold. Any `ok: false` row is a bug or tampering.
+  getInvariants() {
+    const escrowHeld = _FinanceLedgerEngine.round(this.getEscrows().filter((e2) => e2.status === "held").reduce((a, e2) => a + e2.remaining, 0));
+    const holds = _FinanceLedgerEngine.round(Array.from(this.wallets.values()).reduce((a, w) => a + w.fundsOnHold, 0));
+    const pendingRecords = _FinanceLedgerEngine.round(Array.from(this.payouts.values()).filter((p) => p.status === "requested").reduce((a, p) => a + p.amount, 0));
+    const pendingWallets = _FinanceLedgerEngine.round(Array.from(this.wallets.values()).reduce((a, w) => a + w.pendingWithdrawals, 0));
+    const walletSum = _FinanceLedgerEngine.round(Array.from(this.wallets.values()).reduce((a, w) => a + w.availableBalance, 0));
+    const walletLedger = _FinanceLedgerEngine.round(this.accountNet("2010") + this.accountNet("2020"));
+    const rows = [
+      { name: "Escrow account (2030) equals sum of held escrows", expected: escrowHeld, actual: this.accountNet("2030") },
+      { name: "Buyer funds-on-hold equals held escrows", expected: escrowHeld, actual: holds },
+      { name: "Pending payout account (2040) equals requested payouts", expected: pendingRecords, actual: this.accountNet("2040") },
+      { name: "Wallet pending-withdrawals equals requested payouts", expected: pendingRecords, actual: pendingWallets },
+      { name: "Wallet balances equal wallet liability accounts (2010+2020)", expected: walletLedger, actual: walletSum }
+    ];
+    return rows.map((r2) => ({ ...r2, ok: _FinanceLedgerEngine.round(r2.expected - r2.actual) === 0 }));
+  }
   getReconciliationSummary() {
     const wallets = this.getWallets();
     const driftedWallets = wallets.filter((w) => !w.isReconciled);
     const accountBalances = CHART_OF_ACCOUNTS.map((coa) => {
       let totalDebits = 0;
       let totalCredits = 0;
-      for (const j of this.journals) {
-        for (const e2 of j.entries) {
-          if (e2.accountCode === coa.code) {
-            totalDebits = _FinanceLedgerEngine.round(totalDebits + e2.debit);
-            totalCredits = _FinanceLedgerEngine.round(totalCredits + e2.credit);
-          }
-        }
+      for (const j of this.journals) for (const e2 of j.entries) if (e2.accountCode === coa.code) {
+        totalDebits = _FinanceLedgerEngine.round(totalDebits + e2.debit);
+        totalCredits = _FinanceLedgerEngine.round(totalCredits + e2.credit);
       }
       const net = coa.normalBalance === "debit" ? totalDebits - totalCredits : totalCredits - totalDebits;
-      return {
-        ...coa,
-        totalDebits,
-        totalCredits,
-        netBalance: _FinanceLedgerEngine.round(net)
-      };
+      return { ...coa, totalDebits, totalCredits, netBalance: _FinanceLedgerEngine.round(net) };
     });
     const sumDebits = _FinanceLedgerEngine.round(accountBalances.reduce((acc, a) => acc + a.totalDebits, 0));
     const sumCredits = _FinanceLedgerEngine.round(accountBalances.reduce((acc, a) => acc + a.totalCredits, 0));
     return {
-      trialBalance: {
-        accounts: accountBalances,
-        totalDebits: sumDebits,
-        totalCredits: sumCredits,
-        isBalanced: Math.abs(sumDebits - sumCredits) === 0,
-        difference: _FinanceLedgerEngine.round(Math.abs(sumDebits - sumCredits))
-      },
-      walletAudit: {
-        totalWalletsChecked: wallets.length,
-        reconciledCount: wallets.filter((w) => w.isReconciled).length,
-        driftedCount: driftedWallets.length,
-        driftedWallets
-      },
+      trialBalance: { accounts: accountBalances, totalDebits: sumDebits, totalCredits: sumCredits, isBalanced: _FinanceLedgerEngine.round(Math.abs(sumDebits - sumCredits)) === 0, difference: _FinanceLedgerEngine.round(Math.abs(sumDebits - sumCredits)) },
+      walletAudit: { totalWalletsChecked: wallets.length, reconciledCount: wallets.filter((w) => w.isReconciled).length, driftedCount: driftedWallets.length, driftedWallets },
+      invariants: this.getInvariants(),
       exceptions: this.exceptions
     };
   }
@@ -69579,19 +69538,10 @@ var FinanceLedgerEngine = class _FinanceLedgerEngine {
     if (!ex) throw new Error("Exception record not found");
     ex.status = "resolved";
     ex.investigationNotes = notes;
-    ex.resolvedAt = (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").substring(0, 19);
-    this.auditLogs.unshift({
-      id: `FAUD-${Date.now()}`,
-      actor,
-      role: "super_admin",
-      action: "RECONCILIATION_EXCEPTION_RESOLVED",
-      target: `Exception #${ex.id}`,
-      reason: notes,
-      timestamp: ex.resolvedAt
-    });
+    ex.resolvedAt = nowStr();
+    this.audit({ actor, action: "RECONCILIATION_EXCEPTION_RESOLVED", target: `Exception #${ex.id}`, reason: notes });
     return ex;
   }
-  // Getters for Read-Only Collections
   getJournals() {
     return this.journals;
   }
@@ -69610,48 +69560,37 @@ var FinanceLedgerEngine = class _FinanceLedgerEngine {
   getExceptions() {
     return this.exceptions;
   }
-  // CSV Report Generator
-  generateCsvExport(reportType, filters = {}) {
+  // CSV Report Generator (formula-injection safe)
+  generateCsvExport(reportType, _filters = {}) {
     const now = (/* @__PURE__ */ new Date()).toISOString().replace("T", "_").substring(0, 19);
-    let rows = [];
+    const rows = [];
+    const line = (...cells) => rows.push(cells.map((c) => typeof c === "number" ? csvNum(c) : csvText(c)).join(","));
     switch (reportType) {
       case "trial_balance": {
-        rows.push('"Account Code","Account Name","Account Type","Normal Balance","Total Debits","Total Credits","Net Balance"');
+        line("Account Code", "Account Name", "Account Type", "Normal Balance", "Total Debits", "Total Credits", "Net Balance");
         const summary = this.getReconciliationSummary();
-        for (const a of summary.trialBalance.accounts) {
-          rows.push(`"${a.code}","${a.name}","${a.type}","${a.normalBalance}",${a.totalDebits.toFixed(2)},${a.totalCredits.toFixed(2)},${a.netBalance.toFixed(2)}`);
-        }
-        rows.push(`"TOTAL","Trial Balance Sum","","Balanced: ${summary.trialBalance.isBalanced}",${summary.trialBalance.totalDebits.toFixed(2)},${summary.trialBalance.totalCredits.toFixed(2)},${summary.trialBalance.difference.toFixed(2)}`);
+        for (const a of summary.trialBalance.accounts) line(a.code, a.name, a.type, a.normalBalance, a.totalDebits, a.totalCredits, a.netBalance);
+        line("TOTAL", "Trial Balance Sum", "", `Balanced: ${summary.trialBalance.isBalanced}`, summary.trialBalance.totalDebits, summary.trialBalance.totalCredits, summary.trialBalance.difference);
         return { filename: `workperhour_trial_balance_${now}.csv`, content: rows.join("\n") };
       }
       case "ledger_journals": {
-        rows.push('"Journal ID","Posting Date","Reference","Event Type","Status","Account Code","Account Name","Debit","Credit","Description","User ID","Order ID"');
-        for (const j of this.journals) {
-          for (const e2 of j.entries) {
-            rows.push(`"${j.id}","${j.postingDate}","${j.reference}","${j.eventType}","${j.status}","${e2.accountCode}","${e2.accountName}",${e2.debit.toFixed(2)},${e2.credit.toFixed(2)},"${e2.description.replace(/"/g, '""')}","${e2.userId || ""}","${e2.orderId || ""}"`);
-          }
-        }
+        line("Journal ID", "Posting Date", "Reference", "Event Type", "Status", "Account Code", "Account Name", "Debit", "Credit", "Description", "User ID", "Order ID");
+        for (const j of this.journals) for (const e2 of j.entries) line(j.id, j.postingDate, j.reference, j.eventType, j.status, e2.accountCode, e2.accountName, e2.debit, e2.credit, e2.description, e2.userId || "", e2.orderId || "");
         return { filename: `workperhour_double_entry_ledger_${now}.csv`, content: rows.join("\n") };
       }
       case "wallets": {
-        rows.push('"Wallet ID","User ID","User Name","Email","Role","Currency","Available Balance","Escrow On Hold","Pending Incoming","Status","Ledger Reconciled"');
-        for (const w of this.getWallets()) {
-          rows.push(`"${w.id}","${w.userId}","${w.userName}","${w.userEmail}","${w.userRole}","${w.currency}",${w.availableBalance.toFixed(2)},${w.fundsOnHold.toFixed(2)},${w.pendingIncoming.toFixed(2)},"${w.status}","${w.isReconciled}"`);
-        }
+        line("Wallet ID", "User ID", "User Name", "Email", "Role", "Currency", "Available Balance", "Escrow On Hold", "Pending Incoming", "Status", "Ledger Reconciled");
+        for (const w of this.getWallets()) line(w.id, w.userId, w.userName, w.userEmail, w.userRole, w.currency, w.availableBalance, w.fundsOnHold, w.pendingIncoming, w.status, String(w.isReconciled));
         return { filename: `workperhour_wallet_balances_${now}.csv`, content: rows.join("\n") };
       }
       case "transactions": {
-        rows.push('"Transaction ID","Type","Amount","Currency","Status","Timestamp","User Name","Role","Order ID","Journal ID","Description"');
-        for (const t2 of this.transactions) {
-          rows.push(`"${t2.id}","${t2.type}",${t2.amount.toFixed(2)},"${t2.currency}","${t2.status}","${t2.timestamp}","${t2.userName}","${t2.userRole}","${t2.relatedOrderId || ""}","${t2.journalId || ""}","${t2.description.replace(/"/g, '""')}"`);
-        }
+        line("Transaction ID", "Type", "Amount", "Currency", "Status", "Timestamp", "User Name", "Role", "Order ID", "Journal ID", "Description");
+        for (const t2 of this.transactions) line(t2.id, t2.type, t2.amount, t2.currency, t2.status, t2.timestamp, t2.userName, t2.userRole, t2.relatedOrderId || "", t2.journalId || "", t2.description);
         return { filename: `workperhour_financial_transactions_${now}.csv`, content: rows.join("\n") };
       }
       case "audit_trail": {
-        rows.push('"Log ID","Actor","Role","Action","Target","Reason","Journal ID","Timestamp"');
-        for (const a of this.auditLogs) {
-          rows.push(`"${a.id}","${a.actor}","${a.role}","${a.action}","${a.target}","${(a.reason || "").replace(/"/g, '""')}","${a.journalId || ""}","${a.timestamp}"`);
-        }
+        line("Log ID", "Actor", "Role", "Action", "Target", "Reason", "Journal ID", "Timestamp");
+        for (const a of this.auditLogs) line(a.id, a.actor, a.role, a.action, a.target, a.reason || "", a.journalId || "", a.timestamp);
         return { filename: `workperhour_financial_audit_${now}.csv`, content: rows.join("\n") };
       }
       default:
@@ -69661,11 +69600,269 @@ var FinanceLedgerEngine = class _FinanceLedgerEngine {
 };
 var financeLedger = new FinanceLedgerEngine();
 
+// src/server/siteSettings.ts
+var DEFAULT_SITE_SETTINGS = {
+  website: {
+    siteName: "WorkPerHour",
+    siteTagline: "Hire Top Freelancers & Discover Quality Services",
+    supportEmail: "support@workperhour.com",
+    contactPhone: "+1 (800) 555-WORK",
+    helpdeskUrl: "https://support.workperhour.com",
+    maintenanceMode: false,
+    copyrightText: "\xA9 2026 WorkPerHour Inc. All rights reserved."
+  },
+  commission: {
+    commissionPercent: 10,
+    // 10% platform take rate
+    buyerProcessingFeePercent: 2.5,
+    // 2.5% payment processing surcharge
+    buyerProcessingFeeFixed: 0,
+    minimumOrderAmount: 10,
+    escrowProtectionDays: 14,
+    // 14-day mandatory vault
+    commissionDeductionTiming: "on_escrow_release"
+  },
+  memberships: {
+    membershipsEnabled: true,
+    freelancerPlans: [
+      { id: "plan_free", name: "Standard Freelancer", priceMonthly: 0, bidsPerMonth: 15, commissionDiscountPercent: 0, featuredBadge: false, enabled: true },
+      { id: "plan_pro", name: "WorkPerHour Pro Talent", priceMonthly: 29, bidsPerMonth: 80, commissionDiscountPercent: 2, featuredBadge: true, enabled: true }
+    ],
+    buyerPlans: [
+      { id: "buyer_free", name: "Standard Client", priceMonthly: 0, jobPostsPerMonth: 10, zeroBuyerFee: false, enabled: true },
+      { id: "buyer_enterprise", name: "Enterprise Client", priceMonthly: 99, jobPostsPerMonth: 999, zeroBuyerFee: true, enabled: true }
+    ]
+  },
+  marketplace: {
+    gigModerationRequired: false,
+    // published directly by default
+    projectModerationRequired: false,
+    minimumGigPrice: 10,
+    maximumGigPrice: 1e4,
+    minimumProjectBudget: 20,
+    maxActiveOrdersPerFreelancer: 15,
+    autoCompleteDeliveredDays: 3,
+    allowBuyerCancellationRequests: true
+  },
+  wallets: {
+    minimumWithdrawalAmount: 50,
+    maximumWithdrawalPerTransaction: 5e3,
+    dailyWithdrawalLimit: 1e4,
+    payoutProcessingSchedule: "manual_review_over_threshold",
+    manualReviewThresholdAmount: 500,
+    platformCoversGatewayFees: true,
+    allowedPayoutMethods: {
+      upi: true,
+      bankTransfer: true,
+      stripeConnect: true,
+      razorpayX: true,
+      paypal: true
+    },
+    depositHoldDaysBeforeWithdraw: 0
+  },
+  localization: {
+    defaultCurrency: "USD",
+    currencySymbolPlacement: "before",
+    decimalPlaces: 2,
+    primaryLanguage: "en_US",
+    dateFormat: "YYYY-MM-DD",
+    timezone: "UTC"
+  },
+  security: {
+    allowNewRegistrations: true,
+    requireEmailVerification: false,
+    requireKycForPayouts: true,
+    requireAdmin2FA: true,
+    maxFailedLoginsLockout: 5,
+    sessionTimeoutMinutes: 60,
+    minPasswordLength: 8
+  },
+  integrations: {
+    emailSenderName: "WorkPerHour Notifications",
+    emailSenderAddress: "notifications@workperhour.com",
+    sendWelcomeEmail: true,
+    sendOrderStatusEmails: true,
+    sendPayoutStatusEmails: true,
+    sendDisputeAdminAlerts: true,
+    stripeEnabled: true,
+    stripePublishableKeyMasked: "pk_test_51Mz...\u2022\u2022\u2022\u2022",
+    razorpayEnabled: true,
+    geminiAiEnabled: true
+  }
+};
+var SiteSettingsService = class {
+  constructor() {
+    this.history = [];
+    this.settings = JSON.parse(JSON.stringify(DEFAULT_SITE_SETTINGS));
+    this.seedInitialHistory();
+    financeLedger.setPlatformCommissionRate(this.settings.commission.commissionPercent);
+  }
+  seedInitialHistory() {
+    this.history.push({
+      id: "SET-HIST-101",
+      timestamp: "2026-10-01 10:00:00",
+      section: "Platform Commission",
+      settingName: "Platform Commission (%)",
+      oldValue: "Initial Configuration",
+      newValue: "10%",
+      actor: "System Setup",
+      notes: "Standard 10% platform take rate initialized with 14-day escrow protection."
+    });
+    this.history.push({
+      id: "SET-HIST-102",
+      timestamp: "2026-10-05 09:30:00",
+      section: "Wallets & Withdrawals",
+      settingName: "Manual Review Threshold",
+      oldValue: "$1,000.00",
+      newValue: "$500.00",
+      actor: "Admin Chief",
+      notes: "Tightened payout compliance threshold to $500 for enhanced risk management."
+    });
+  }
+  getSettings() {
+    return JSON.parse(JSON.stringify(this.settings));
+  }
+  getSettingsHistory() {
+    return [...this.history];
+  }
+  // Shared Fee Calculation Service: Used across entire application
+  calculateFeeSplit(orderAmount, customCommissionPercent) {
+    const commissionPercent = customCommissionPercent !== void 0 ? customCommissionPercent : this.settings.commission.commissionPercent;
+    const roundedAmount = FinanceLedgerEngine.round(Math.max(0, orderAmount));
+    const platformFee = FinanceLedgerEngine.round(roundedAmount * (commissionPercent / 100));
+    const freelancerAmount = FinanceLedgerEngine.round(roundedAmount - platformFee);
+    const freelancerPercent = FinanceLedgerEngine.round(100 - commissionPercent);
+    const buyerFee = FinanceLedgerEngine.round(
+      roundedAmount * (this.settings.commission.buyerProcessingFeePercent / 100) + this.settings.commission.buyerProcessingFeeFixed
+    );
+    const totalBuyerCharged = FinanceLedgerEngine.round(roundedAmount + buyerFee);
+    return {
+      orderAmount: roundedAmount,
+      commissionPercent,
+      platformFee,
+      freelancerPercent,
+      freelancerAmount,
+      buyerProcessingFeePercent: this.settings.commission.buyerProcessingFeePercent,
+      buyerFee,
+      totalBuyerCharged
+    };
+  }
+  // Update a specific section of settings
+  updateSection(section, updates, actor = "Super Admin") {
+    const currentSection = this.settings[section];
+    const timestamp = (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").substring(0, 19);
+    for (const [key, val] of Object.entries(updates)) {
+      const oldVal = currentSection[key];
+      const oldStr = typeof oldVal === "object" ? JSON.stringify(oldVal) : String(oldVal);
+      const newStr = typeof val === "object" ? JSON.stringify(val) : String(val);
+      if (oldStr !== newStr) {
+        this.history.unshift({
+          id: `SET-HIST-${Date.now()}-${Math.floor(Math.random() * 900 + 100)}`,
+          timestamp,
+          section: section.charAt(0).toUpperCase() + section.slice(1),
+          settingName: key,
+          oldValue: oldStr,
+          newValue: newStr,
+          actor,
+          notes: `Updated ${key} in ${section} section`
+        });
+      }
+    }
+    this.settings[section] = {
+      ...currentSection,
+      ...updates
+    };
+    if (section === "commission" && updates.commissionPercent !== void 0) {
+      const newRate = Number(updates.commissionPercent);
+      if (newRate >= 0 && newRate <= 100) {
+        financeLedger.setPlatformCommissionRate(newRate);
+      }
+    }
+    return JSON.parse(JSON.stringify(this.settings[section]));
+  }
+  // Reset a section or all settings back to default
+  resetToDefaults(section, actor = "Super Admin") {
+    const timestamp = (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").substring(0, 19);
+    if (section) {
+      this.settings[section] = JSON.parse(JSON.stringify(DEFAULT_SITE_SETTINGS[section]));
+      this.history.unshift({
+        id: `SET-HIST-${Date.now()}`,
+        timestamp,
+        section: section.charAt(0).toUpperCase() + section.slice(1),
+        settingName: "Reset Section",
+        oldValue: "Custom Values",
+        newValue: "Factory Defaults",
+        actor,
+        notes: `Reset ${section} section to default configuration`
+      });
+      if (section === "commission") {
+        financeLedger.setPlatformCommissionRate(DEFAULT_SITE_SETTINGS.commission.commissionPercent);
+      }
+    } else {
+      this.settings = JSON.parse(JSON.stringify(DEFAULT_SITE_SETTINGS));
+      this.history.unshift({
+        id: `SET-HIST-${Date.now()}`,
+        timestamp,
+        section: "All Settings",
+        settingName: "Factory Reset",
+        oldValue: "Custom Values",
+        newValue: "Factory Defaults",
+        actor,
+        notes: "Reset all 9 settings sections back to platform factory defaults"
+      });
+      financeLedger.setPlatformCommissionRate(DEFAULT_SITE_SETTINGS.commission.commissionPercent);
+    }
+    return this.getSettings();
+  }
+};
+var siteSettings = new SiteSettingsService();
+
 // server.ts
 import_dotenv.default.config();
 var __dirname = path2.dirname(fileURLToPath(import.meta.url));
 var app = (0, import_express.default)();
-app.use(import_express.default.json());
+app.use(import_express.default.json({ limit: "100kb" }));
+var IS_PROD = process.env.NODE_ENV === "production";
+var ADMIN_TOKEN = process.env.ADMIN_API_TOKEN || "";
+var REQUIRE_KYC_FOR_PAYOUTS = process.env.REQUIRE_KYC_FOR_PAYOUTS !== "false";
+financeLedger.configure({
+  commissionPercent: DEFAULT_SITE_SETTINGS.commission.commissionPercent,
+  minimumOrderAmount: DEFAULT_SITE_SETTINGS.commission.minimumOrderAmount,
+  minimumWithdrawalAmount: DEFAULT_SITE_SETTINGS.wallets.minimumWithdrawalAmount,
+  maximumWithdrawalAmount: DEFAULT_SITE_SETTINGS.wallets.maximumWithdrawalPerTransaction
+});
+function requireAdmin(req, res, next) {
+  if (!ADMIN_TOKEN) {
+    if (IS_PROD) return res.status(503).json({ error: "ADMIN_API_TOKEN is not configured; admin endpoints are disabled." });
+    return next();
+  }
+  const header = String(req.headers.authorization || "");
+  const given = header.startsWith("Bearer ") ? header.slice(7) : "";
+  const a = Buffer.from(given);
+  const b = Buffer.from(ADMIN_TOKEN);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return res.status(401).json({ error: "Admin authorization required." });
+  next();
+}
+var adminActor = (_req) => "Admin";
+var rateBuckets = /* @__PURE__ */ new Map();
+function rateLimit(max, windowMs) {
+  return (req, res, next) => {
+    const key = `${req.ip}:${req.method}:${req.baseUrl}${req.path}`;
+    const now = Date.now();
+    const b = rateBuckets.get(key);
+    if (!b || b.resetAt < now) {
+      rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+    if (++b.count > max) return res.status(429).json({ error: "Too many requests. Please slow down." });
+    next();
+  };
+}
+app.use("/api/admin", requireAdmin);
+for (const sub of ["force-complete", "force-cancel", "admin-notes", "extend-time", "mute"]) {
+  app.use(`/api/orders/:id/${sub}`, requireAdmin);
+}
+app.use(["/api/payouts", "/api/refunds", "/api/audit-logs"], (req, res, next) => req.method === "GET" ? requireAdmin(req, res, next) : next());
 var server = createServer(app);
 var wss = new import_websocket_server.default({ server });
 var ai = new GoogleGenAI2({
@@ -70386,25 +70583,222 @@ var siteFeeSettings = {
   updatedAt: (/* @__PURE__ */ new Date()).toISOString().split("T")[0],
   updatedBy: "Admin Chief (Super Admin)"
 };
-app.get("/api/admin/settings", (req, res) => res.json(siteFeeSettings));
-app.post("/api/admin/settings", (req, res) => {
-  siteFeeSettings = {
-    ...siteFeeSettings,
-    ...req.body,
-    updatedAt: (/* @__PURE__ */ new Date()).toISOString().split("T")[0],
-    updatedBy: req.body.updatedBy || "Super Admin"
-  };
-  auditLogs.unshift({
-    id: "log_" + Date.now(),
-    actor: req.body.updatedBy || "Super Admin",
-    role: "super_admin",
-    action: "SITE_FEE_SETTINGS_UPDATED",
-    target: "Platform Settings & Fee Structure",
-    details: `Updated settings: Commission=${siteFeeSettings.freelancerCommissionRate}%, EscrowHold=${siteFeeSettings.escrowHoldDays}d, BuyerFee=${siteFeeSettings.buyerProcessingFeeRate}%`,
-    timestamp: (/* @__PURE__ */ new Date()).toLocaleString()
+var handleGetSiteSettings = (req, res) => {
+  res.json({
+    success: true,
+    settings: siteFeeSettings,
+    ...siteFeeSettings
   });
-  res.json({ success: true, settings: siteFeeSettings });
-});
+};
+var handlePostSiteSettings = (req, res) => {
+  try {
+    const body = req.body || {};
+    if (body.freelancerCommissionRate !== void 0) {
+      const num = Number(body.freelancerCommissionRate);
+      if (isNaN(num) || num < 0 || num > 100) {
+        return res.status(400).json({ error: "Commission rate must be between 0 and 100%" });
+      }
+      body.freelancerCommissionRate = num;
+    }
+    if (body.buyerProcessingFeeRate !== void 0) {
+      const num = Number(body.buyerProcessingFeeRate);
+      if (isNaN(num) || num < 0 || num > 100) {
+        return res.status(400).json({ error: "Buyer processing fee rate must be between 0 and 100%" });
+      }
+      body.buyerProcessingFeeRate = num;
+    }
+    if (body.minOrderAmount !== void 0) {
+      const num = Number(body.minOrderAmount);
+      if (isNaN(num) || num < 1) {
+        return res.status(400).json({ error: "Minimum order amount must be at least $1" });
+      }
+      body.minOrderAmount = num;
+    }
+    if (body.escrowHoldDays !== void 0) {
+      const num = Number(body.escrowHoldDays);
+      if (isNaN(num) || num < 0) {
+        return res.status(400).json({ error: "Escrow hold days must be a non-negative number" });
+      }
+      body.escrowHoldDays = num;
+    }
+    if (body.minPayoutThreshold !== void 0) {
+      const num = Number(body.minPayoutThreshold);
+      if (isNaN(num) || num < 1) {
+        return res.status(400).json({ error: "Minimum payout threshold must be at least $1" });
+      }
+      body.minPayoutThreshold = num;
+    }
+    siteFeeSettings = {
+      ...siteFeeSettings,
+      ...body,
+      updatedAt: (/* @__PURE__ */ new Date()).toISOString().split("T")[0],
+      updatedBy: body.updatedBy || "Super Admin"
+    };
+    if (typeof siteFeeSettings.freelancerCommissionRate === "number") {
+      DEFAULT_SITE_SETTINGS.commission.commissionPercent = siteFeeSettings.freelancerCommissionRate;
+      DEFAULT_SITE_SETTINGS.commission.escrowProtectionDays = siteFeeSettings.escrowHoldDays || DEFAULT_SITE_SETTINGS.commission.escrowProtectionDays;
+      DEFAULT_SITE_SETTINGS.commission.minimumOrderAmount = siteFeeSettings.minOrderAmount || DEFAULT_SITE_SETTINGS.commission.minimumOrderAmount;
+      DEFAULT_SITE_SETTINGS.wallets.minimumWithdrawalAmount = siteFeeSettings.minPayoutThreshold || DEFAULT_SITE_SETTINGS.wallets.minimumWithdrawalAmount;
+      financeLedger.configure({
+        commissionPercent: siteFeeSettings.freelancerCommissionRate,
+        minimumOrderAmount: siteFeeSettings.minOrderAmount || 5,
+        minimumWithdrawalAmount: siteFeeSettings.minPayoutThreshold || 5
+      });
+    }
+    auditLogs.unshift({
+      id: "log_" + Date.now(),
+      actor: body.updatedBy || "Super Admin",
+      role: "super_admin",
+      action: "SITE_FEE_SETTINGS_UPDATED",
+      target: "Platform Settings & Fee Structure",
+      details: `Updated settings: Commission=${siteFeeSettings.freelancerCommissionRate}%, EscrowHold=${siteFeeSettings.escrowHoldDays}d, BuyerFee=${siteFeeSettings.buyerProcessingFeeRate}%`,
+      timestamp: (/* @__PURE__ */ new Date()).toLocaleString()
+    });
+    res.json({ success: true, settings: siteFeeSettings, ...siteFeeSettings });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || "Failed to update site settings" });
+  }
+};
+app.get("/api/admin/settings", handleGetSiteSettings);
+app.get("/api/admin/site-settings", handleGetSiteSettings);
+app.post("/api/admin/settings", handlePostSiteSettings);
+app.post("/api/admin/site-settings", handlePostSiteSettings);
+function syncUserBalances() {
+  for (const u of users) {
+    const b = financeLedger.getWalletBalance(u.id);
+    if (b !== null) u.walletBalance = b;
+  }
+}
+syncUserBalances();
+function ensureWallet(userId) {
+  const u = users.find((x2) => x2.id === userId);
+  if (!u || u.role === "admin" || u.role === "super_admin") return;
+  financeLedger.ensureWallet({ userId: u.id, name: u.name, email: u.email, role: gigs.some((g) => g.freelancerId === u.id) ? "freelancer" : "buyer" });
+}
+function pushSystemMessage(orderId, text) {
+  messages.push({
+    id: "msg_" + randomUUID2().slice(0, 12),
+    orderId,
+    senderId: "system",
+    senderName: "WorkSphere Escrow Vault",
+    text,
+    timestamp: (/* @__PURE__ */ new Date()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+  });
+}
+function closeActiveDispute(orderId, status, notes) {
+  const d = disputes.find((x2) => x2.orderId === orderId && (x2.status === "open" || x2.status === "under_investigation"));
+  if (d) {
+    d.status = status;
+    d.resolutionNotes = notes;
+  }
+}
+var releaseCompletedOrders = /* @__PURE__ */ new Set();
+for (const o of orders) {
+  if (o.status === "completed") releaseCompletedOrders.add(o.id);
+}
+var refundCompletedOrders = /* @__PURE__ */ new Set();
+for (const o of orders) {
+  if (o.status === "cancelled") refundCompletedOrders.add(o.id);
+}
+var requestKeyCache = /* @__PURE__ */ new Map();
+function assertOrderOpen(order) {
+  if (order.status === "completed") throw new Error("Order is already completed; funds were already released.");
+  if (order.status === "cancelled") throw new Error("Order is already cancelled; funds were already handled.");
+}
+function releaseOrderFunds(order, actor, reason, requestKey) {
+  if (requestKey && requestKeyCache.has(requestKey)) {
+    return requestKeyCache.get(requestKey);
+  }
+  if (order.status === "completed") {
+    const replayed = financeLedger.replay(requestKey);
+    if (replayed) {
+      if (requestKey) requestKeyCache.set(requestKey, replayed);
+      return replayed;
+    }
+    throw new Error("Order is already completed; funds were already released.");
+  }
+  assertOrderOpen(order);
+  const result = financeLedger.releaseEscrow({ orderId: order.id, actor, reason, requestKey });
+  order.status = "completed";
+  const seller = users.find((u) => u.id === order.sellerId);
+  if (seller && !releaseCompletedOrders.has(order.id)) {
+    releaseCompletedOrders.add(order.id);
+    seller.earned = (seller.earned || 0) + result.freelancerNet;
+    seller.completedJobs = (seller.completedJobs || 0) + 1;
+  }
+  syncUserBalances();
+  if (requestKey) requestKeyCache.set(requestKey, result);
+  return result;
+}
+function refundOrderFunds(order, amount, actor, reason, requestKey) {
+  if (requestKey && requestKeyCache.has(requestKey)) {
+    return requestKeyCache.get(requestKey);
+  }
+  if (order.status === "cancelled") {
+    const replayed = financeLedger.replay(requestKey);
+    if (replayed) {
+      if (requestKey) requestKeyCache.set(requestKey, replayed);
+      return replayed;
+    }
+    throw new Error("Order is already cancelled; funds were already handled.");
+  }
+  assertOrderOpen(order);
+  const result = financeLedger.refundEscrow({ orderId: order.id, amount, reason, actor, requestKey });
+  if (result.remaining === 0) {
+    order.status = "cancelled";
+    refundCompletedOrders.add(order.id);
+  }
+  const existingRecord = refunds.find((r2) => r2.orderId === order.id && (r2.status === "pending" || r2.amount === result.refunded));
+  if (existingRecord) {
+    existingRecord.status = "approved";
+    existingRecord.amount = result.refunded;
+  } else {
+    refunds.push({
+      id: "ref_" + randomUUID2().slice(0, 12),
+      orderId: order.id,
+      buyerId: order.buyerId,
+      amount: result.refunded,
+      reason,
+      status: "approved",
+      createdAt: (/* @__PURE__ */ new Date()).toISOString().substring(0, 10)
+    });
+  }
+  syncUserBalances();
+  if (requestKey) requestKeyCache.set(requestKey, result);
+  return result;
+}
+function splitOrderFunds(order, refundAmount, actor, reason, requestKey) {
+  if (requestKey && requestKeyCache.has(requestKey)) {
+    return requestKeyCache.get(requestKey);
+  }
+  assertOrderOpen(order);
+  const result = financeLedger.resolveEscrowSplit({ orderId: order.id, refundAmount, reason, actor });
+  order.status = "completed";
+  const seller = users.find((u) => u.id === order.sellerId);
+  if (seller && !releaseCompletedOrders.has(order.id)) {
+    releaseCompletedOrders.add(order.id);
+    seller.earned = (seller.earned || 0) + result.release.freelancerNet;
+    seller.completedJobs = (seller.completedJobs || 0) + 1;
+  }
+  const existingRecord = refunds.find((r2) => r2.orderId === order.id && (r2.status === "pending" || r2.amount === refundAmount));
+  if (existingRecord) {
+    existingRecord.status = "approved";
+    existingRecord.amount = refundAmount;
+  } else {
+    refunds.push({
+      id: "ref_" + randomUUID2().slice(0, 12),
+      orderId: order.id,
+      buyerId: order.buyerId,
+      amount: refundAmount,
+      reason,
+      status: "approved",
+      createdAt: (/* @__PURE__ */ new Date()).toISOString().substring(0, 10)
+    });
+  }
+  syncUserBalances();
+  if (requestKey) requestKeyCache.set(requestKey, result);
+  return result;
+}
 app.get("/api/users", (req, res) => res.json(users));
 app.get("/api/gigs", (req, res) => res.json(gigs));
 app.get("/api/projects", (req, res) => res.json(projects));
@@ -70551,70 +70945,41 @@ app.post("/api/users/:id/flag", (req, res) => {
   res.json({ success: true, isFlagged: user.isFlagged, flagReason: user.flagReason, user });
 });
 app.post("/api/orders/:id/force-complete", (req, res) => {
-  const order = orders.find((o) => o.id === req.params.id);
-  if (!order) return res.status(404).json({ error: "Order not found" });
-  const dispute = disputes.find((d) => d.orderId === order.id && (d.status === "open" || d.status === "under_investigation"));
-  if (dispute) {
-    dispute.status = "resolved_release";
-    dispute.resolutionNotes = req.body.reason || "Admin administrative force-release in seller favor.";
+  try {
+    const order = orders.find((o) => o.id === req.params.id);
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    const reason = String(req.body.reason || "Admin administrative force-release in seller favor.");
+    const result = releaseOrderFunds(order, adminActor(req), reason, req.body.requestKey);
+    closeActiveDispute(order.id, "resolved_release", reason);
+    pushSystemMessage(order.id, `\u2705 Order Approved & Completed by Administration! Escrow funds released to freelancer wallet. Net Payout: $${result.freelancerNet}.`);
+    res.json({ success: true, order: enrichOrderWithServiceInfo(order), result });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
-  const result = financeLedger.releaseEscrow({
-    orderId: order.id,
-    orderTitle: order.title,
-    amount: order.amount,
-    sellerId: order.sellerId,
-    buyerId: order.buyerId,
-    actor: req.body.actor || "Super Admin"
-  });
-  order.status = "completed";
-  const seller = users.find((u) => u.id === order.sellerId);
-  if (seller) {
-    seller.walletBalance = (seller.walletBalance || 0) + result.freelancerNet;
-  }
-  const sysMsg = {
-    id: "msg_" + Date.now(),
-    orderId: order.id,
-    senderId: "system",
-    senderName: "WorkSphere Escrow Vault",
-    text: `\u2705 Order Approved & Completed by Administration! Escrow funds released to freelancer wallet. Net Payout: $${result.freelancerNet}.`,
-    timestamp: (/* @__PURE__ */ new Date()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-  };
-  messages.push(sysMsg);
-  res.json({ success: true, order: enrichOrderWithServiceInfo(order), result });
 });
 app.post("/api/orders/:id/force-cancel", (req, res) => {
-  const order = orders.find((o) => o.id === req.params.id);
-  if (!order) return res.status(404).json({ error: "Order not found" });
-  const isPartial = req.body.refundType === "partial";
-  const refundAmount = isPartial && Number(req.body.customAmount) > 0 ? Number(req.body.customAmount) : order.amount;
-  const dispute = disputes.find((d) => d.orderId === order.id && (d.status === "open" || d.status === "under_investigation"));
-  if (dispute) {
-    dispute.status = isPartial ? "resolved_partial" : "resolved_refund";
-    dispute.resolutionNotes = req.body.reason || "Admin administrative cancellation and refund.";
+  try {
+    const order = orders.find((o) => o.id === req.params.id);
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    const reason = String(req.body.reason || "Admin cancelled order and refunded buyer wallet");
+    const isPartial = req.body.refundType === "partial";
+    let result;
+    let refundAmount;
+    if (isPartial) {
+      refundAmount = Number(req.body.customAmount);
+      result = splitOrderFunds(order, refundAmount, adminActor(req), reason);
+      closeActiveDispute(order.id, "resolved_partial", reason);
+      pushSystemMessage(order.id, `\u2696\uFE0F Order resolved by Administration. $${refundAmount} refunded to buyer; the remainder was released to the freelancer. Reason: ${reason}`);
+    } else {
+      result = refundOrderFunds(order, void 0, adminActor(req), reason, req.body.requestKey);
+      refundAmount = result.refunded;
+      closeActiveDispute(order.id, "resolved_refund", reason);
+      pushSystemMessage(order.id, `\u{1F6A8} Order Cancelled & Refunded by Administration. $${refundAmount} credited back to buyer wallet balance. Reason: ${reason}`);
+    }
+    res.json({ success: true, order: enrichOrderWithServiceInfo(order), result });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
-  const result = financeLedger.refundEscrow({
-    orderId: order.id,
-    orderTitle: order.title,
-    amount: refundAmount,
-    buyerId: order.buyerId,
-    reason: req.body.reason || "Admin cancelled order and refunded buyer wallet",
-    actor: req.body.actor || "Super Admin"
-  });
-  order.status = "cancelled";
-  const buyer = users.find((u) => u.id === order.buyerId);
-  if (buyer) {
-    buyer.walletBalance = (buyer.walletBalance || 0) + refundAmount;
-  }
-  const sysMsg = {
-    id: "msg_" + Date.now(),
-    orderId: order.id,
-    senderId: "system",
-    senderName: "WorkSphere Escrow Vault",
-    text: `\u{1F6A8} Order Cancelled & Refunded by Administration. $${refundAmount} credited back to buyer wallet balance. Reason: ${req.body.reason || "Administrative cancellation."}`,
-    timestamp: (/* @__PURE__ */ new Date()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-  };
-  messages.push(sysMsg);
-  res.json({ success: true, order: enrichOrderWithServiceInfo(order), result });
 });
 app.post("/api/orders/:id/message", (req, res) => {
   const order = orders.find((o) => o.id === req.params.id);
@@ -70713,13 +71078,7 @@ app.get("/api/payments/user/:userId", (req, res) => {
     const userId = req.params.userId;
     const u = users.find((user) => user.id === userId);
     if (u) {
-      financeLedger.ensureWalletExists({
-        id: u.id,
-        name: u.name,
-        email: u.email,
-        role: u.role,
-        initialBalance: u.walletBalance
-      });
+      ensureWallet(u.id);
     }
     const walletData = financeLedger.getWalletById(userId);
     const availableBalance = walletData?.wallet.availableBalance ?? (u?.walletBalance ?? 0);
@@ -70754,98 +71113,138 @@ app.get("/api/payments/user/:userId", (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-app.post("/api/payments/deposit", (req, res) => {
+var ALLOWED_METHODS = {
+  "UPI": "upi",
+  "Bank Transfer": "bankTransfer",
+  "Stripe": "stripeConnect",
+  "Razorpay": "razorpayX",
+  "PayPal": "paypal"
+};
+function resolvePayoutUserId(req) {
+  const authUser = req.user?.id || req.user?.uid;
+  if (authUser && typeof authUser === "string") return authUser.trim();
+  const headerUserId = req.headers["x-authenticated-user-id"] || req.headers["x-user-id"];
+  if (typeof headerUserId === "string" && headerUserId.trim()) {
+    return headerUserId.trim();
+  }
+  const bodyId = req.body?.freelancerId || req.body?.userId;
+  if (typeof bodyId === "string" && bodyId.trim()) {
+    return bodyId.trim();
+  }
+  return "";
+}
+function handlePayoutRequest(req, res) {
   try {
-    const { userId, amount, paymentMethod, providerReference } = req.body;
-    const numAmount = Number(amount);
-    if (isNaN(numAmount) || numAmount <= 0) {
+    const freelancerId = resolvePayoutUserId(req);
+    if (!freelancerId) {
+      return res.status(401).json({ error: "User authorization required for payout requests." });
+    }
+    const user = users.find((u) => u.id === freelancerId);
+    if (!user) return res.status(404).json({ error: "User not found" });
+    if (user.status !== "active") return res.status(403).json({ error: `Account is ${user.status}; withdrawals are blocked.` });
+    ensureWallet(freelancerId);
+    if (REQUIRE_KYC_FOR_PAYOUTS && !user.verified) {
+      return res.status(403).json({ error: "Identity verification (KYC) is required before withdrawing." });
+    }
+    const rawMethod = String(req.body?.method || "Bank Transfer");
+    const settingKey = ALLOWED_METHODS[rawMethod];
+    if (!settingKey || !DEFAULT_SITE_SETTINGS.wallets.allowedPayoutMethods[settingKey]) {
+      return res.status(400).json({ error: `Unsupported payout method "${rawMethod}".` });
+    }
+    const numAmount = Number(req.body?.amount);
+    if (!Number.isFinite(numAmount) || numAmount <= 0) {
+      return res.status(400).json({ error: "Please enter a valid withdrawal amount greater than $0.00" });
+    }
+    const currentBal = financeLedger.getWalletBalance(freelancerId) ?? user.walletBalance;
+    if (currentBal < numAmount) {
+      return res.status(400).json({ error: `Insufficient available funds. Available: $${currentBal.toFixed(2)}, Requested: $${numAmount.toFixed(2)}` });
+    }
+    const id = "pay_" + randomUUID2().slice(0, 8);
+    const accountDetails = String(req.body?.accountDetails || "Primary Bank Account");
+    const { payout } = financeLedger.requestPayout({
+      payoutId: id,
+      freelancerId,
+      amount: numAmount,
+      method: rawMethod,
+      accountDetails,
+      actor: `user:${freelancerId}`
+    });
+    const record = {
+      id,
+      freelancerId,
+      amount: payout.amount,
+      method: rawMethod,
+      status: "pending",
+      createdAt: (/* @__PURE__ */ new Date()).toISOString().substring(0, 10),
+      accountDetails: payout.accountDetails
+    };
+    payouts.unshift(record);
+    syncUserBalances();
+    auditLogs.unshift({
+      id: "log_" + Date.now(),
+      actor: user.name,
+      role: user.role,
+      action: "PAYOUT_REQUESTED",
+      target: `Payout #${record.id}`,
+      details: `User requested withdrawal of $${numAmount.toFixed(2)} via ${record.method}`,
+      timestamp: (/* @__PURE__ */ new Date()).toLocaleString()
+    });
+    const newBalance = financeLedger.getWalletBalance(freelancerId) ?? user.walletBalance;
+    const transaction = financeLedger.getTransactions().find((t2) => t2.relatedPayoutId === id);
+    res.status(201).json({
+      success: true,
+      newBalance,
+      payout: record,
+      transaction,
+      ...record
+    });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+}
+app.post("/api/payments/deposit", rateLimit(10, 6e4), (req, res) => {
+  try {
+    if (IS_PROD && process.env.ALLOW_SIMULATED_DEPOSITS !== "true") {
+      return res.status(501).json({ error: "Deposits require a connected payment gateway in production." });
+    }
+    const userId = String(req.body?.userId || "");
+    const amount = Number(req.body?.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ error: "Please enter a valid deposit amount greater than $0.00" });
+    }
+    if (amount > 5e3) {
+      return res.status(400).json({ error: "Simulated deposits are limited to $5,000." });
     }
     const u = users.find((user) => user.id === userId);
     if (!u) return res.status(404).json({ error: "User not found" });
-    financeLedger.ensureWalletExists({
-      id: u.id,
-      name: u.name,
-      email: u.email,
-      role: u.role,
-      initialBalance: u.walletBalance
-    });
-    const result = financeLedger.depositFunds({
+    ensureWallet(u.id);
+    const key = String(req.body?.idempotencyKey || req.body?.providerReference || randomUUID2());
+    const result = financeLedger.creditDeposit({
       userId: u.id,
-      userName: u.name,
-      userEmail: u.email,
-      userRole: u.role,
-      amount: numAmount,
-      paymentMethod: paymentMethod || "Instant Card Settlement",
-      providerReference: providerReference || `PAY-${Date.now()}`,
-      actor: u.name
+      amount,
+      reference: `SIM-${key}`,
+      idempotencyKey: `SIM-${u.id}-${key}`,
+      actor: "Simulated Gateway",
+      source: "simulated"
     });
-    u.walletBalance = result.newBalance;
+    syncUserBalances();
+    const newBalance = financeLedger.getWalletBalance(u.id) ?? u.walletBalance;
+    const transaction = financeLedger.getTransactions().find((t2) => t2.journalId === result.journal.id);
     auditLogs.unshift({
       id: "log_" + Date.now(),
       actor: u.name,
       role: u.role,
       action: "FUNDS_DEPOSITED",
       target: `User ${u.name}`,
-      details: `Deposited $${numAmount.toFixed(2)} via ${paymentMethod || "Credit Card"}. New Balance: $${result.newBalance.toFixed(2)}`,
+      details: `Deposited $${amount.toFixed(2)} (simulated). New Balance: $${newBalance.toFixed(2)}`,
       timestamp: (/* @__PURE__ */ new Date()).toLocaleString()
     });
-    res.json({ success: true, newBalance: result.newBalance, transaction: result.transaction });
+    res.json({ success: true, newBalance, transaction });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
-app.post("/api/payments/withdraw", (req, res) => {
-  try {
-    const { userId, amount, method, accountDetails } = req.body;
-    const numAmount = Number(amount);
-    if (isNaN(numAmount) || numAmount <= 0) {
-      return res.status(400).json({ error: "Please enter a valid withdrawal amount greater than $0.00" });
-    }
-    const u = users.find((user) => user.id === userId);
-    if (!u) return res.status(404).json({ error: "User not found" });
-    if (u.walletBalance < numAmount) {
-      return res.status(400).json({ error: `Insufficient available funds. Available: $${u.walletBalance.toFixed(2)}, Requested: $${numAmount.toFixed(2)}` });
-    }
-    financeLedger.ensureWalletExists({
-      id: u.id,
-      name: u.name,
-      email: u.email,
-      role: u.role,
-      initialBalance: u.walletBalance
-    });
-    const result = financeLedger.requestPayout({
-      userId: u.id,
-      amount: numAmount,
-      method: method || "Bank Transfer",
-      accountDetails: accountDetails || "Primary Bank Account",
-      actor: u.name
-    });
-    u.walletBalance = result.newBalance;
-    const newPayout = {
-      id: "pay_" + Date.now(),
-      freelancerId: u.id,
-      amount: numAmount,
-      method: method || "Bank Transfer",
-      status: "pending",
-      createdAt: (/* @__PURE__ */ new Date()).toISOString().split("T")[0],
-      accountDetails: accountDetails || "Primary Bank Wire"
-    };
-    payouts.unshift(newPayout);
-    auditLogs.unshift({
-      id: "log_" + Date.now(),
-      actor: u.name,
-      role: u.role,
-      action: "PAYOUT_REQUESTED",
-      target: `Payout #${newPayout.id}`,
-      details: `User requested withdrawal of $${numAmount.toFixed(2)} via ${newPayout.method}`,
-      timestamp: (/* @__PURE__ */ new Date()).toLocaleString()
-    });
-    res.json({ success: true, newBalance: result.newBalance, payout: newPayout, transaction: result.transaction });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
+app.post("/api/payments/withdraw", rateLimit(10, 6e4), handlePayoutRequest);
 app.post("/api/payments/escrow/release", (req, res) => {
   try {
     const { orderId } = req.body;
@@ -70856,26 +71255,9 @@ app.post("/api/payments/escrow/release", (req, res) => {
     }
     const seller = users.find((u) => u.id === order.sellerId);
     const buyer = users.find((u) => u.id === order.buyerId);
-    if (seller) {
-      financeLedger.ensureWalletExists({ id: seller.id, name: seller.name, email: seller.email, role: "freelancer", initialBalance: seller.walletBalance });
-    }
-    if (buyer) {
-      financeLedger.ensureWalletExists({ id: buyer.id, name: buyer.name, email: buyer.email, role: "buyer", initialBalance: buyer.walletBalance });
-    }
-    const result = financeLedger.releaseEscrow({
-      orderId: order.id,
-      orderTitle: order.title,
-      amount: order.amount,
-      sellerId: order.sellerId,
-      buyerId: order.buyerId,
-      actor: buyer?.name || "Authorized Buyer"
-    });
-    order.status = "completed";
-    if (seller) {
-      seller.walletBalance += result.freelancerNet;
-      seller.earned = (seller.earned || 0) + result.freelancerNet;
-      seller.completedJobs = (seller.completedJobs || 0) + 1;
-    }
+    if (seller) ensureWallet(seller.id);
+    if (buyer) ensureWallet(buyer.id);
+    const result = releaseOrderFunds(order, buyer?.name || "Authorized Buyer", "Buyer approved work");
     auditLogs.unshift({
       id: "log_" + Date.now(),
       actor: buyer?.name || "Buyer",
@@ -70899,60 +71281,52 @@ app.post("/api/payments/escrow/refund", (req, res) => {
       return res.status(400).json({ error: "Order is already cancelled/refunded." });
     }
     const buyer = users.find((u) => u.id === order.buyerId);
-    if (buyer) {
-      financeLedger.ensureWalletExists({ id: buyer.id, name: buyer.name, email: buyer.email, role: "buyer", initialBalance: buyer.walletBalance });
-    }
-    financeLedger.refundEscrow({
-      orderId: order.id,
-      orderTitle: order.title,
-      amount: order.amount,
-      buyerId: order.buyerId,
-      reason: reason || "Buyer escrow refund agreement",
-      actor: buyer?.name || "Buyer"
-    });
-    order.status = "cancelled";
-    if (buyer) {
-      buyer.walletBalance += order.amount;
-    }
-    refunds.unshift({
-      id: "ref_" + Date.now(),
-      orderId: order.id,
-      buyerId: order.buyerId,
-      amount: order.amount,
-      reason: reason || "Escrow cancellation & refund to wallet",
-      status: "approved",
-      createdAt: (/* @__PURE__ */ new Date()).toISOString().substring(0, 10)
-    });
+    if (buyer) ensureWallet(buyer.id);
+    const result = refundOrderFunds(order, void 0, buyer?.name || "Buyer", reason || "Buyer escrow refund agreement");
     auditLogs.unshift({
       id: "log_" + Date.now(),
       actor: buyer?.name || "Buyer",
       role: "buyer",
-      action: "ESCROW_REFUNDED_TO_BUYER",
+      action: "ESCROW_REFUNDED_BY_BUYER",
       target: `Order #${order.id}`,
-      details: `Refunded $${order.amount} from escrow back to buyer wallet. Reason: ${reason || "Mutual cancellation"}`,
+      details: `Buyer requested escrow refund of $${result.refunded} to wallet. Reason: ${reason || "Escrow cancellation"}`,
       timestamp: (/* @__PURE__ */ new Date()).toLocaleString()
     });
-    res.json({ success: true, order, newBalance: buyer?.walletBalance });
+    res.json({ success: true, order, refunded: result.refunded });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
-app.post("/api/payments/escrow/deposit", (req, res) => {
+app.post("/api/payments/escrow/deposit", rateLimit(20, 6e4), (req, res) => {
   try {
-    const { orderId, userId, amount, source } = req.body;
-    const numAmount = Number(amount);
+    const orderId = String(req.body?.orderId || "");
     const order = orders.find((o) => o.id === orderId);
     if (!order) return res.status(404).json({ error: "Order not found" });
-    const buyer = users.find((u) => u.id === userId);
-    if (!buyer) return res.status(404).json({ error: "User not found" });
-    if (source === "wallet") {
-      if (buyer.walletBalance < numAmount) {
-        return res.status(400).json({ error: "Insufficient wallet balance. Please top up your wallet or pay via card." });
-      }
-      buyer.walletBalance -= numAmount;
+    if (order.status !== "in_progress") {
+      return res.status(400).json({ error: `Cannot fund escrow for order in status "${order.status}"` });
     }
+    const buyerId = order.buyerId;
+    const sellerId = order.sellerId;
+    const buyer = users.find((u) => u.id === buyerId);
+    const seller = users.find((u) => u.id === sellerId);
+    if (!buyer || !seller) return res.status(404).json({ error: "Buyer or seller not found" });
+    ensureWallet(buyerId);
+    ensureWallet(sellerId);
+    financeLedger.fundEscrow({
+      orderId: order.id,
+      orderTitle: order.title,
+      amount: order.amount,
+      buyerId,
+      sellerId,
+      actor: `user:${buyerId}`
+    });
     order.status = "funded_in_escrow";
-    res.json({ success: true, order, newBalance: buyer.walletBalance });
+    const today = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
+    order.escrowProtectionStartDate = today;
+    order.escrowProtectionEndDate = new Date(Date.now() + DEFAULT_SITE_SETTINGS.commission.escrowProtectionDays * 864e5).toISOString().split("T")[0];
+    syncUserBalances();
+    const newBalance = financeLedger.getWalletBalance(buyerId) ?? buyer.walletBalance;
+    res.json({ success: true, order, newBalance });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -71147,7 +71521,7 @@ app.post("/api/admin/finance/wallets/:id/freeze", (req, res) => {
   try {
     const { reason } = req.body;
     if (!reason) return res.status(400).json({ error: "Mandatory reason required to freeze a wallet" });
-    const wallet = financeLedger.freezeWallet(req.params.id, reason, req.body.actor || "Super Admin");
+    const wallet = financeLedger.freezeWallet(req.params.id, reason, adminActor(req));
     res.json(wallet);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -71156,7 +71530,7 @@ app.post("/api/admin/finance/wallets/:id/freeze", (req, res) => {
 app.post("/api/admin/finance/wallets/:id/unfreeze", (req, res) => {
   try {
     const { reason } = req.body;
-    const wallet = financeLedger.unfreezeWallet(req.params.id, reason || "Administrative review completed", req.body.actor || "Super Admin");
+    const wallet = financeLedger.unfreezeWallet(req.params.id, reason || "Administrative review completed", adminActor(req));
     res.json(wallet);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -71166,7 +71540,7 @@ app.post("/api/admin/finance/wallets/:id/restrict", (req, res) => {
   try {
     const { reason } = req.body;
     if (!reason) return res.status(400).json({ error: "Mandatory reason required to restrict a wallet" });
-    const wallet = financeLedger.restrictWallet(req.params.id, reason, req.body.actor || "Super Admin");
+    const wallet = financeLedger.restrictWallet(req.params.id, reason, adminActor(req));
     res.json(wallet);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -71211,7 +71585,7 @@ app.post("/api/admin/finance/ledger/:id/reverse", (req, res) => {
   try {
     const { reason, actor } = req.body;
     if (!reason) return res.status(400).json({ error: "Mandatory accounting reversal reason required" });
-    const reversal = financeLedger.reverseJournal(req.params.id, reason, actor || "Chief Finance Officer");
+    const reversal = financeLedger.reverseJournal(req.params.id, reason, adminActor(req));
     res.json(reversal);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -71237,9 +71611,11 @@ app.get("/api/admin/finance/escrow", (req, res) => {
         buyerEmail: buyer?.email || "",
         sellerName: seller?.name || "Freelancer #" + o.sellerId,
         sellerEmail: seller?.email || "",
-        platformFeeRate: "10%",
-        platformFeeAmount: Math.round(o.amount * 0.1),
-        freelancerNetAmount: Math.round(o.amount * 0.9),
+        platformFeeRate: `${financeLedger.getPlatformCommissionRate()}%`,
+        platformFeeAmount: FinanceLedgerEngine.round(o.amount * financeLedger.getPlatformCommissionRate() / 100),
+        freelancerNetAmount: FinanceLedgerEngine.round(o.amount - o.amount * financeLedger.getPlatformCommissionRate() / 100),
+        ledgerEscrowStatus: financeLedger.getEscrow(o.id)?.status || "not_funded",
+        ledgerEscrowHeld: financeLedger.getEscrow(o.id)?.remaining ?? 0,
         escrowState,
         isDisputed
       };
@@ -71257,21 +71633,7 @@ app.post("/api/admin/finance/escrow/:orderId/release", (req, res) => {
     if (activeDispute) {
       return res.status(400).json({ error: `Cannot release escrow: Order #${order.id} is under active dispute (${activeDispute.id}). Resolve the dispute first.` });
     }
-    const result = financeLedger.releaseEscrow({
-      orderId: order.id,
-      orderTitle: order.title,
-      amount: order.amount,
-      sellerId: order.sellerId,
-      buyerId: order.buyerId,
-      actor: req.body.actor || "Super Admin"
-    });
-    order.status = "completed";
-    const seller = users.find((u) => u.id === order.sellerId);
-    if (seller) {
-      seller.walletBalance += result.freelancerNet;
-      seller.earned = (seller.earned || 0) + result.freelancerNet;
-      seller.completedJobs = (seller.completedJobs || 0) + 1;
-    }
+    const result = releaseOrderFunds(order, adminActor(req), String(req.body.reason || "Administrative escrow release"), req.body.requestKey);
     res.json({ success: true, order, journal: result.journal, freelancerNet: result.freelancerNet, platformFee: result.platformFee });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -71279,35 +71641,11 @@ app.post("/api/admin/finance/escrow/:orderId/release", (req, res) => {
 });
 app.post("/api/admin/finance/escrow/:orderId/refund", (req, res) => {
   try {
-    const { reason, actor } = req.body;
     const order = orders.find((o) => o.id === req.params.orderId);
     if (!order) return res.status(404).json({ error: "Order not found" });
-    const result = financeLedger.refundEscrow({
-      orderId: order.id,
-      orderTitle: order.title,
-      amount: order.amount,
-      buyerId: order.buyerId,
-      reason: reason || "Administrative escrow refund approval",
-      actor: actor || "Super Admin"
-    });
-    const existingRefund = refunds.find((r2) => r2.orderId === order.id);
-    if (existingRefund) {
-      existingRefund.status = "approved";
-    } else {
-      refunds.push({
-        id: "ref_" + Date.now(),
-        orderId: order.id,
-        buyerId: order.buyerId,
-        amount: order.amount,
-        reason: reason || "Administrative escrow refund",
-        status: "approved",
-        createdAt: (/* @__PURE__ */ new Date()).toISOString().substring(0, 10)
-      });
-    }
-    const buyer = users.find((u) => u.id === order.buyerId);
-    if (buyer) {
-      buyer.walletBalance += order.amount;
-    }
+    const amount = req.body.amount === void 0 || req.body.amount === "" ? void 0 : Number(req.body.amount);
+    const result = refundOrderFunds(order, amount, adminActor(req), String(req.body.reason || "Administrative escrow refund approval"), req.body.requestKey);
+    closeActiveDispute(order.id, "resolved_refund", String(req.body.reason || "Administrative escrow refund"));
     res.json({ success: true, order, journal: result.journal });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -71331,106 +71669,111 @@ app.get("/api/admin/finance/payouts", (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-app.post("/api/admin/finance/payouts/:id/approve", (req, res) => {
+function payoutAudit(req, action, p, details) {
+  auditLogs.unshift({
+    id: "FAUD-" + randomUUID2().slice(0, 12),
+    actor: adminActor(req),
+    role: "super_admin",
+    action,
+    target: `Payout #${p.id}`,
+    details,
+    timestamp: (/* @__PURE__ */ new Date()).toLocaleString()
+  });
+}
+var approvePayout = (req, res) => {
   try {
     const p = payouts.find((pay) => pay.id === req.params.id);
     if (!p) return res.status(404).json({ error: "Payout not found" });
     if (p.status !== "pending") return res.status(400).json({ error: `Cannot approve payout in status "${p.status}"` });
     p.status = "approved";
-    auditLogs.unshift({
-      id: "FAUD-" + Date.now(),
-      actor: req.body.actor || "Chief Finance Officer",
-      role: "super_admin",
-      action: "PAYOUT_APPROVED",
-      target: `Payout #${p.id}`,
-      details: `Approved payout of $${p.amount} via ${p.method} for freelancer ${p.freelancerId}`,
-      timestamp: (/* @__PURE__ */ new Date()).toLocaleString()
-    });
+    payoutAudit(req, "PAYOUT_APPROVED", p, `Approved payout of $${p.amount} via ${p.method} for freelancer ${p.freelancerId}`);
     res.json(p);
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
-});
-app.post("/api/admin/finance/payouts/:id/process", (req, res) => {
+};
+var processPayout = (req, res) => {
   try {
     const p = payouts.find((pay) => pay.id === req.params.id);
     if (!p) return res.status(404).json({ error: "Payout not found" });
-    if (p.status !== "pending" && p.status !== "approved") {
-      return res.status(400).json({ error: `Cannot process payout in status "${p.status}"` });
+    if (p.status !== "pending" && p.status !== "approved") return res.status(400).json({ error: `Cannot process payout in status "${p.status}"` });
+    if (p.amount >= 500 && p.status !== "approved") {
+      return res.status(400).json({ error: "Payouts of $500.00 or more require explicit administrative approval before processing." });
     }
-    const freelancer = users.find((u) => u.id === p.freelancerId);
-    const journal = financeLedger.postJournal({
-      reference: `PAY-${p.id}-DISBURSED`,
-      description: `Disbursed Payout #${p.id} via ${p.method} to ${freelancer?.name || p.freelancerId} (${p.accountDetails})`,
-      eventType: "PAYOUT_SETTLED",
-      idempotencyKey: `IDEMP-PAY-PROCESS-${p.id}`,
-      actor: req.body.actor || "Super Admin",
-      entries: [
-        {
-          accountCode: "2020",
-          accountName: "Freelancer Wallets Payable",
-          debit: p.amount,
-          credit: 0,
-          currency: "USD",
-          description: `Withdrawn payout for ${freelancer?.name || p.freelancerId}`,
-          userId: p.freelancerId,
-          payoutId: p.id
-        },
-        {
-          accountCode: "1030",
-          accountName: "Payout Gateway Transit",
-          debit: 0,
-          credit: p.amount,
-          currency: "USD",
-          description: `Disbursed through ${p.method} gateway`,
-          payoutId: p.id
-        }
-      ]
-    });
+    const { journal } = financeLedger.settlePayout({ payoutId: p.id, actor: adminActor(req), providerReference: req.body?.providerReference });
     p.status = "processed";
-    if (freelancer && freelancer.walletBalance >= p.amount) {
-      freelancer.walletBalance = Math.max(0, freelancer.walletBalance - p.amount);
-    }
-    res.json({ success: true, payout: p, journal });
+    payoutAudit(req, "PAYOUT_PROCESSED", p, `Processed payout of $${p.amount} via ${p.method}`);
+    syncUserBalances();
+    res.json({ success: true, payout: p, journal, ...p });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
-});
-app.post("/api/admin/finance/payouts/:id/reject", (req, res) => {
+};
+var rejectPayout = (req, res) => {
   try {
-    const { reason, actor } = req.body;
     const p = payouts.find((pay) => pay.id === req.params.id);
     if (!p) return res.status(404).json({ error: "Payout not found" });
-    if (p.status === "processed") return res.status(400).json({ error: "Cannot reject an already settled and processed payout." });
-    financeLedger.cancelPayout({
-      payoutId: p.id,
-      freelancerId: p.freelancerId,
-      amount: p.amount,
-      reason: reason || "Administrative rejection",
-      actor: actor || "Chief Finance Officer"
-    });
+    if (p.status !== "pending" && p.status !== "approved") return res.status(400).json({ error: `Cannot reject payout in status "${p.status}"` });
+    financeLedger.cancelPayout({ payoutId: p.id, reason: String(req.body?.reason || "Administrative rejection"), actor: adminActor(req) });
     p.status = "cancelled";
-    res.json({ success: true, payout: p });
+    payoutAudit(req, "PAYOUT_REJECTED", p, `Rejected payout of $${p.amount}; funds returned to wallet`);
+    syncUserBalances();
+    res.json({ success: true, payout: p, ...p });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
-});
-app.post("/api/admin/finance/payouts/:id/retry", (req, res) => {
+};
+var failPayout = (req, res) => {
+  try {
+    const p = payouts.find((pay) => pay.id === req.params.id);
+    if (!p) return res.status(404).json({ error: "Payout not found" });
+    if (p.status !== "pending" && p.status !== "approved") return res.status(400).json({ error: `Cannot fail payout in status "${p.status}"` });
+    financeLedger.failPayout({ payoutId: p.id, reason: String(req.body?.reason || "Gateway reported a transfer failure"), actor: adminActor(req) });
+    p.status = "failed";
+    payoutAudit(req, "PAYOUT_FAILED", p, `Payout of $${p.amount} failed; funds returned to wallet`);
+    syncUserBalances();
+    res.json(p);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+};
+var retryPayout = (req, res) => {
   try {
     const p = payouts.find((pay) => pay.id === req.params.id);
     if (!p) return res.status(404).json({ error: "Payout not found" });
     if (p.status !== "failed") return res.status(400).json({ error: "Only failed payouts can be retried." });
+    financeLedger.retryPayout({ payoutId: p.id, actor: adminActor(req) });
     p.status = "pending";
-    auditLogs.unshift({
-      id: "FAUD-" + Date.now(),
-      actor: req.body.actor || "Super Admin",
-      role: "super_admin",
-      action: "PAYOUT_RETRIED",
-      target: `Payout #${p.id}`,
-      details: `Re-queued failed payout of $${p.amount} for retry`,
-      timestamp: (/* @__PURE__ */ new Date()).toLocaleString()
-    });
+    payoutAudit(req, "PAYOUT_RETRIED", p, `Re-queued failed payout of $${p.amount}`);
+    syncUserBalances();
     res.json(p);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+};
+app.post("/api/admin/finance/payouts/:id/approve", approvePayout);
+app.post("/api/admin/finance/payouts/:id/process", processPayout);
+app.post("/api/admin/finance/payouts/:id/reject", rejectPayout);
+app.post("/api/admin/finance/payouts/:id/fail", failPayout);
+app.post("/api/admin/finance/payouts/:id/retry", retryPayout);
+app.patch("/api/admin/payouts/:id/approve", approvePayout);
+app.patch("/api/admin/payouts/:id/process", processPayout);
+app.patch("/api/admin/payouts/:id/fail", failPayout);
+app.post("/api/payouts", rateLimit(10, 6e4), handlePayoutRequest);
+app.post("/api/wallet/deposit", rateLimit(10, 6e4), (req, res) => {
+  try {
+    if (IS_PROD && process.env.ALLOW_SIMULATED_DEPOSITS !== "true") {
+      return res.status(501).json({ error: "Deposits require a connected payment gateway." });
+    }
+    const userId = String(req.body?.userId || "");
+    const amount = Number(req.body?.amount);
+    if (!users.some((u) => u.id === userId)) return res.status(404).json({ error: "User not found" });
+    ensureWallet(userId);
+    if (Number.isFinite(amount) && amount > 5e3) return res.status(400).json({ error: "Simulated deposits are limited to $5,000." });
+    const key = String(req.body?.idempotencyKey || randomUUID2());
+    const { replayed } = financeLedger.creditDeposit({ userId, amount, reference: `SIM-${key}`, idempotencyKey: `SIM-${userId}-${key}`, actor: "Simulated Gateway", source: "simulated" });
+    syncUserBalances();
+    res.json({ success: true, replayed, balance: financeLedger.getWalletBalance(userId) });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -71447,7 +71790,7 @@ app.post("/api/admin/finance/reconciliation/resolve/:id", (req, res) => {
   try {
     const { notes, actor } = req.body;
     if (!notes) return res.status(400).json({ error: "Investigation notes required to mark exception resolved" });
-    const resolved = financeLedger.resolveException(req.params.id, notes, actor || "Chief Auditor");
+    const resolved = financeLedger.resolveException(req.params.id, notes, adminActor(req));
     res.json(resolved);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -71472,7 +71815,7 @@ app.post("/api/admin/finance/adjustments/preview", (req, res) => {
 });
 app.post("/api/admin/finance/adjustments", (req, res) => {
   try {
-    const { userId, amount, direction, category, reason, evidenceReference, actor } = req.body;
+    const { userId, amount, direction, category, reason, evidenceReference, requestKey } = req.body;
     const result = financeLedger.executeAdministrativeAdjustment({
       userId,
       amount: Number(amount),
@@ -71480,12 +71823,10 @@ app.post("/api/admin/finance/adjustments", (req, res) => {
       category,
       reason,
       evidenceReference,
-      actor: actor || "Super Admin"
+      actor: adminActor(req),
+      requestKey
     });
-    const user = users.find((u) => u.id === userId);
-    if (user) {
-      user.walletBalance = result.wallet.availableBalance;
-    }
+    syncUserBalances();
     res.json(result);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -71938,24 +72279,50 @@ app.post("/api/proposals", (req, res) => {
   if (proj) proj.proposalsCount += 1;
   res.json(newProp);
 });
-app.post("/api/orders", (req, res) => {
-  const newOrd = {
-    id: "ord_" + Date.now(),
-    title: req.body.title,
-    buyerId: req.body.buyerId || "user_2",
-    sellerId: req.body.sellerId || "user_1",
-    amount: Number(req.body.amount),
-    status: "funded_in_escrow",
-    createdAt: (/* @__PURE__ */ new Date()).toISOString().split("T")[0],
-    dueDate: req.body.dueDate || new Date(Date.now() + 10 * 864e5).toISOString().split("T")[0],
-    escrowProtectionStartDate: (/* @__PURE__ */ new Date()).toISOString().split("T")[0],
-    escrowProtectionEndDate: new Date(Date.now() + 14 * 864e5).toISOString().split("T")[0],
-    gigId: req.body.gigId,
-    projectId: req.body.projectId
-  };
-  const enriched = enrichOrderWithServiceInfo(newOrd);
-  orders.unshift(enriched);
-  res.json(enriched);
+app.post("/api/orders", rateLimit(30, 6e4), (req, res) => {
+  try {
+    const title = typeof req.body?.title === "string" ? req.body.title.trim() : "";
+    if (title.length < 3) return res.status(400).json({ error: "A valid order title is required." });
+    const buyerId = String(req.body?.buyerId || "");
+    const sellerId = String(req.body?.sellerId || "");
+    const buyer = users.find((u) => u.id === buyerId);
+    const seller = users.find((u) => u.id === sellerId);
+    if (!buyer || !seller) return res.status(404).json({ error: "Buyer or seller not found." });
+    if (buyerId === sellerId) return res.status(400).json({ error: "You cannot order from yourself." });
+    ensureWallet(buyerId);
+    ensureWallet(sellerId);
+    if (buyer.status !== "active" || seller.status !== "active") return res.status(403).json({ error: "Both accounts must be active to place an order." });
+    const id = "ord_" + randomUUID2().slice(0, 12);
+    const today = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
+    const rawAmount = Number(req.body?.amount);
+    const isInquiry = rawAmount === 0 && /^inquiry:/i.test(title);
+    let newOrd;
+    if (isInquiry) {
+      newOrd = { id, title, buyerId, sellerId, amount: 0, status: "in_progress", createdAt: today, dueDate: req.body.dueDate || new Date(Date.now() + 7 * 864e5).toISOString().split("T")[0], gigId: req.body.gigId, projectId: req.body.projectId };
+    } else {
+      financeLedger.fundEscrow({ orderId: id, orderTitle: title, amount: rawAmount, buyerId, sellerId, actor: `user:${buyerId}` });
+      newOrd = {
+        id,
+        title,
+        buyerId,
+        sellerId,
+        amount: rawAmount,
+        status: "funded_in_escrow",
+        createdAt: today,
+        dueDate: req.body.dueDate || new Date(Date.now() + 10 * 864e5).toISOString().split("T")[0],
+        escrowProtectionStartDate: today,
+        escrowProtectionEndDate: new Date(Date.now() + DEFAULT_SITE_SETTINGS.commission.escrowProtectionDays * 864e5).toISOString().split("T")[0],
+        gigId: req.body.gigId,
+        projectId: req.body.projectId
+      };
+      syncUserBalances();
+    }
+    const enriched = enrichOrderWithServiceInfo(newOrd);
+    orders.unshift(enriched);
+    res.status(201).json(enriched);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 app.patch("/api/admin/proposals/:id", (req, res) => {
   const p = proposals.find((prop) => prop.id === req.params.id);
@@ -72021,7 +72388,6 @@ app.patch("/api/admin/users/:id", (req, res) => {
   if (req.body.bio !== void 0) u.bio = req.body.bio;
   if (req.body.skills !== void 0) u.skills = Array.isArray(req.body.skills) ? req.body.skills : req.body.skills.split(",").map((s2) => s2.trim()).filter(Boolean);
   if (req.body.hourlyRate !== void 0) u.hourlyRate = Number(req.body.hourlyRate);
-  if (req.body.walletBalance !== void 0) u.walletBalance = Number(req.body.walletBalance);
   if (req.body.verified !== void 0) u.verified = Boolean(req.body.verified);
   if (req.body.status !== void 0) u.status = req.body.status;
   auditLogs.unshift({
@@ -72101,6 +72467,13 @@ app.patch("/api/admin/users/:id/verify", (req, res) => {
 app.delete("/api/admin/users/:id", (req, res) => {
   const index = users.findIndex((user) => user.id === req.params.id);
   if (index === -1) return res.status(404).json({ error: "User not found" });
+  const target = users[index];
+  if (financeLedger.hasOutstandingFunds(target.id)) {
+    return res.status(409).json({ error: "User still has wallet funds, pending withdrawals or active escrow. Resolve these before deleting the account." });
+  }
+  if (orders.some((o) => (o.buyerId === target.id || o.sellerId === target.id) && o.status !== "completed" && o.status !== "cancelled" && o.amount > 0)) {
+    return res.status(409).json({ error: "User has active paid orders. Complete or cancel them first." });
+  }
   const deletedUser = users[index];
   users.splice(index, 1);
   gigs = gigs.filter((g) => g.freelancerId !== req.params.id);
@@ -72117,20 +72490,38 @@ app.delete("/api/admin/users/:id", (req, res) => {
   res.json({ success: true, id: deletedUser.id });
 });
 app.patch("/api/admin/disputes/:id/resolve", (req, res) => {
-  const d = disputes.find((disp) => disp.id === req.params.id);
-  if (!d) return res.status(404).json({ error: "Dispute not found" });
-  d.status = req.body.status;
-  d.resolutionNotes = req.body.notes;
-  auditLogs.unshift({
-    id: "log_" + Date.now(),
-    actor: "Admin Chief",
-    role: "super_admin",
-    action: "DISPUTE_RESOLVED",
-    target: `Dispute #${d.id}`,
-    details: `Resolved dispute with status ${req.body.status}. Notes: ${req.body.notes}`,
-    timestamp: (/* @__PURE__ */ new Date()).toLocaleString()
-  });
-  res.json(d);
+  try {
+    const d = disputes.find((disp) => disp.id === req.params.id);
+    if (!d) return res.status(404).json({ error: "Dispute not found" });
+    const status = req.body.status;
+    if (!["open", "under_investigation", "resolved_refund", "resolved_release", "resolved_partial"].includes(status)) {
+      return res.status(400).json({ error: "Invalid dispute status." });
+    }
+    if (d.status.startsWith("resolved")) return res.status(409).json({ error: `Dispute is already ${d.status}.` });
+    const notes = String(req.body.notes || "");
+    const reason = notes.trim().length >= 5 ? notes.trim() : "Dispute resolved by administrator";
+    const order = orders.find((o) => o.id === d.orderId);
+    if (status.startsWith("resolved")) {
+      if (!order) return res.status(404).json({ error: "Order for this dispute not found" });
+      if (status === "resolved_release") releaseOrderFunds(order, adminActor(req), reason);
+      else if (status === "resolved_refund") refundOrderFunds(order, void 0, adminActor(req), reason);
+      else splitOrderFunds(order, Number(req.body.refundAmount), adminActor(req), reason);
+    }
+    d.status = status;
+    d.resolutionNotes = notes;
+    auditLogs.unshift({
+      id: "log_" + randomUUID2().slice(0, 12),
+      actor: adminActor(req),
+      role: "super_admin",
+      action: "DISPUTE_RESOLVED",
+      target: `Dispute #${d.id}`,
+      details: `Resolved dispute with status ${status}. Notes: ${notes}`,
+      timestamp: (/* @__PURE__ */ new Date()).toLocaleString()
+    });
+    res.json(d);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 app.post("/api/admin/tickets/:id/reply", (req, res) => {
   const t2 = supportTickets.find((tick) => tick.id === req.params.id);

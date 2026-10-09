@@ -1,0 +1,6 @@
+# Tell GitHub Linguist that server.js is a generated build artifact,
+# so the repository language stats correctly show TypeScript (100%).
+server.js linguist-generated=true
+server.js linguist-vendored=true
+dist/** linguist-generated=true
+dist/** linguist-vendored=true

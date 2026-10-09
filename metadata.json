@@ -1,0 +1,8 @@
+{
+  "name": "Remix PayFixer",
+  "description": "A streamlined service to resolve payment module errors and ensure seamless transaction processing for all application users.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

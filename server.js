@@ -68668,7 +68668,7 @@ function getApiKeyFromEnv() {
 
 // server.ts
 var import_dotenv = __toESM(require_main(), 1);
-import { randomUUID as randomUUID2, timingSafeEqual } from "crypto";
+import { randomUUID as randomUUID2 } from "crypto";
 
 // src/server/financeLedger.ts
 import { randomUUID } from "node:crypto";
@@ -69831,19 +69831,52 @@ financeLedger.configure({
   minimumWithdrawalAmount: DEFAULT_SITE_SETTINGS.wallets.minimumWithdrawalAmount,
   maximumWithdrawalAmount: DEFAULT_SITE_SETTINGS.wallets.maximumWithdrawalPerTransaction
 });
+function resolveUserId(req) {
+  const authUser = req.user?.id || req.user?.uid;
+  if (authUser && typeof authUser === "string") return authUser.trim();
+  const headerUserId = req.headers["x-authenticated-user-id"] || req.headers["x-user-id"];
+  if (typeof headerUserId === "string" && headerUserId.trim()) {
+    return headerUserId.trim();
+  }
+  const queryUserId = req.query?.userId || req.query?.buyerId || req.query?.sellerId || req.query?.freelancerId;
+  if (typeof queryUserId === "string" && queryUserId.trim()) {
+    return queryUserId.trim();
+  }
+  const bodyUserId = req.body?.buyerId || req.body?.sellerId || req.body?.freelancerId || req.body?.userId || req.body?.senderId;
+  if (typeof bodyUserId === "string" && bodyUserId.trim()) {
+    return bodyUserId.trim();
+  }
+  return "user_1";
+}
+function adminActor(req) {
+  const userId = resolveUserId(req);
+  const u = users.find((user) => user.id === userId);
+  if (u && (u.role === "admin" || u.role === "super_admin" || u.role === "moderator" || u.role === "support")) {
+    return `${u.name} (${u.role})`;
+  }
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    return "Admin API Token";
+  }
+  return "Administrator";
+}
 function requireAdmin(req, res, next) {
+  if (ADMIN_TOKEN) {
+    const header = String(req.headers.authorization || "");
+    const given = header.startsWith("Bearer ") ? header.slice(7) : "";
+    if (given && given === ADMIN_TOKEN) return next();
+  }
+  const userId = resolveUserId(req);
+  const u = users.find((user) => user.id === userId);
+  if (u && (u.role === "admin" || u.role === "super_admin")) {
+    return next();
+  }
   if (!ADMIN_TOKEN) {
     if (IS_PROD) return res.status(503).json({ error: "ADMIN_API_TOKEN is not configured; admin endpoints are disabled." });
     return next();
   }
-  const header = String(req.headers.authorization || "");
-  const given = header.startsWith("Bearer ") ? header.slice(7) : "";
-  const a = Buffer.from(given);
-  const b = Buffer.from(ADMIN_TOKEN);
-  if (a.length !== b.length || !timingSafeEqual(a, b)) return res.status(401).json({ error: "Admin authorization required." });
-  next();
+  return res.status(401).json({ error: "Admin authorization required." });
 }
-var adminActor = (_req) => "Admin";
 var rateBuckets = /* @__PURE__ */ new Map();
 function rateLimit(max, windowMs) {
   return (req, res, next) => {
@@ -70928,15 +70961,15 @@ app.patch("/api/orders/:id/pause-timer", (req, res) => {
   });
   res.json({ success: true, isTimerPaused: order.isTimerPaused, order: enrichOrderWithServiceInfo(order) });
 });
-app.post("/api/users/:id/flag", (req, res) => {
+app.post("/api/users/:id/flag", requireAdmin, (req, res) => {
   const user = users.find((u) => u.id === req.params.id);
   if (!user) return res.status(404).json({ error: "User not found" });
   user.isFlagged = !user.isFlagged;
   user.flagReason = user.isFlagged ? req.body.reason || "Flagged for TOS investigation." : void 0;
   auditLogs.unshift({
     id: "log_" + Date.now(),
-    actor: "Admin Chief",
-    role: "super_admin",
+    actor: adminActor(req),
+    role: "admin",
     action: user.isFlagged ? "USER_FLAGGED_TOS" : "USER_UNFLAGGED_TOS",
     target: `User #${user.id} (${user.name})`,
     details: user.flagReason || "Flag removed",
@@ -71247,9 +71280,15 @@ app.post("/api/payments/deposit", rateLimit(10, 6e4), (req, res) => {
 app.post("/api/payments/withdraw", rateLimit(10, 6e4), handlePayoutRequest);
 app.post("/api/payments/escrow/release", (req, res) => {
   try {
+    const userId = resolveUserId(req);
+    const caller = users.find((u) => u.id === userId);
     const { orderId } = req.body;
     const order = orders.find((o) => o.id === orderId);
     if (!order) return res.status(404).json({ error: "Order not found" });
+    const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || ADMIN_TOKEN && req.headers.authorization;
+    if (!isAdmin && userId !== order.buyerId) {
+      return res.status(403).json({ error: "Unauthorized: Only the order buyer or an administrator can release escrow." });
+    }
     if (order.status === "completed") {
       return res.status(400).json({ error: "Order escrow has already been released and completed." });
     }
@@ -71257,14 +71296,15 @@ app.post("/api/payments/escrow/release", (req, res) => {
     const buyer = users.find((u) => u.id === order.buyerId);
     if (seller) ensureWallet(seller.id);
     if (buyer) ensureWallet(buyer.id);
-    const result = releaseOrderFunds(order, buyer?.name || "Authorized Buyer", "Buyer approved work");
+    const actorName = caller?.name || buyer?.name || "Authorized Buyer";
+    const result = releaseOrderFunds(order, actorName, "Buyer approved work");
     auditLogs.unshift({
       id: "log_" + Date.now(),
-      actor: buyer?.name || "Buyer",
-      role: "buyer",
+      actor: actorName,
+      role: caller?.role || "buyer",
       action: "ESCROW_RELEASED_BY_BUYER",
       target: `Order #${order.id}`,
-      details: `Buyer authorized escrow release of $${order.amount}. $${result.freelancerNet} credited to ${seller?.name || "freelancer"}, $${result.platformFee} platform fee.`,
+      details: `Escrow release authorized of $${order.amount}. $${result.freelancerNet} credited to ${seller?.name || "freelancer"}, $${result.platformFee} platform fee.`,
       timestamp: (/* @__PURE__ */ new Date()).toLocaleString()
     });
     res.json({ success: true, order, freelancerNet: result.freelancerNet, platformFee: result.platformFee });
@@ -71274,22 +71314,29 @@ app.post("/api/payments/escrow/release", (req, res) => {
 });
 app.post("/api/payments/escrow/refund", (req, res) => {
   try {
+    const userId = resolveUserId(req);
+    const caller = users.find((u) => u.id === userId);
     const { orderId, reason } = req.body;
     const order = orders.find((o) => o.id === orderId);
     if (!order) return res.status(404).json({ error: "Order not found" });
+    const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || ADMIN_TOKEN && req.headers.authorization;
+    if (!isAdmin && userId !== order.buyerId && userId !== order.sellerId) {
+      return res.status(403).json({ error: "Unauthorized: Only order participants or administrators can refund escrow." });
+    }
     if (order.status === "cancelled") {
       return res.status(400).json({ error: "Order is already cancelled/refunded." });
     }
     const buyer = users.find((u) => u.id === order.buyerId);
     if (buyer) ensureWallet(buyer.id);
-    const result = refundOrderFunds(order, void 0, buyer?.name || "Buyer", reason || "Buyer escrow refund agreement");
+    const actorName = caller?.name || buyer?.name || "Buyer";
+    const result = refundOrderFunds(order, void 0, actorName, reason || "Escrow cancellation");
     auditLogs.unshift({
       id: "log_" + Date.now(),
-      actor: buyer?.name || "Buyer",
-      role: "buyer",
+      actor: actorName,
+      role: caller?.role || "buyer",
       action: "ESCROW_REFUNDED_BY_BUYER",
       target: `Order #${order.id}`,
-      details: `Buyer requested escrow refund of $${result.refunded} to wallet. Reason: ${reason || "Escrow cancellation"}`,
+      details: `Escrow refund requested of $${result.refunded} to wallet. Reason: ${reason || "Escrow cancellation"}`,
       timestamp: (/* @__PURE__ */ new Date()).toLocaleString()
     });
     res.json({ success: true, order, refunded: result.refunded });
@@ -71448,12 +71495,33 @@ app.post("/api/payments/invoices", (req, res) => {
   }
 });
 app.get("/api/payments/methods/:userId", (req, res) => {
+  const authUserId = resolveUserId(req);
+  const caller = users.find((u) => u.id === authUserId);
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || ADMIN_TOKEN && req.headers.authorization;
+  if (!isAdmin && authUserId !== req.params.userId) {
+    return res.status(403).json({ error: "Unauthorized: Cannot view another user payment methods." });
+  }
   const methods = savedPaymentMethods.filter((m2) => m2.userId === req.params.userId);
-  res.json(methods);
+  const sanitized = methods.map((m2) => ({
+    ...m2,
+    details: {
+      ...m2.details,
+      routingNumber: void 0
+    }
+  }));
+  res.json(sanitized);
 });
 app.post("/api/payments/methods", (req, res) => {
   try {
-    const { userId, type, name, details, isDefault } = req.body;
+    const authUserId = resolveUserId(req);
+    const { type, name, details, isDefault } = req.body;
+    const targetUserId = req.body.userId || authUserId;
+    const caller = users.find((u) => u.id === authUserId);
+    const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || ADMIN_TOKEN && req.headers.authorization;
+    if (!isAdmin && authUserId !== targetUserId) {
+      return res.status(403).json({ error: "Unauthorized: Cannot add payment method to another user account." });
+    }
+    const userId = targetUserId;
     if (!userId || !type || !name) {
       return res.status(400).json({ error: "User ID, method type, and name are required" });
     }
@@ -71478,14 +71546,27 @@ app.post("/api/payments/methods", (req, res) => {
   }
 });
 app.delete("/api/payments/methods/:id", (req, res) => {
+  const authUserId = resolveUserId(req);
+  const method = savedPaymentMethods.find((m2) => m2.id === req.params.id);
+  if (!method) return res.status(404).json({ error: "Payment method not found" });
+  const caller = users.find((u) => u.id === authUserId);
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || ADMIN_TOKEN && req.headers.authorization;
+  if (!isAdmin && method.userId !== authUserId) {
+    return res.status(403).json({ error: "Unauthorized: Cannot delete another user payment method." });
+  }
   const index = savedPaymentMethods.findIndex((m2) => m2.id === req.params.id);
-  if (index === -1) return res.status(404).json({ error: "Payment method not found" });
   savedPaymentMethods.splice(index, 1);
   res.json({ success: true, id: req.params.id });
 });
 app.patch("/api/payments/methods/:id/default", (req, res) => {
+  const authUserId = resolveUserId(req);
   const method = savedPaymentMethods.find((m2) => m2.id === req.params.id);
   if (!method) return res.status(404).json({ error: "Payment method not found" });
+  const caller = users.find((u) => u.id === authUserId);
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || ADMIN_TOKEN && req.headers.authorization;
+  if (!isAdmin && method.userId !== authUserId) {
+    return res.status(403).json({ error: "Unauthorized." });
+  }
   savedPaymentMethods.forEach((m2) => {
     if (m2.userId === method.userId) m2.isDefault = false;
   });
@@ -72021,33 +72102,50 @@ app.get("/api/reviews", (req, res) => res.json(reviews));
 app.get("/api/support-tickets", (req, res) => res.json(supportTickets));
 app.get("/api/audit-logs", (req, res) => res.json(auditLogs));
 app.get("/api/user-emails/:userId", (req, res) => {
+  const authUserId = resolveUserId(req);
+  const caller = users.find((u) => u.id === authUserId);
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || ADMIN_TOKEN && req.headers.authorization;
+  if (!isAdmin && authUserId !== req.params.userId) {
+    return res.status(403).json({ error: "Unauthorized: Cannot view another user email notifications." });
+  }
   const userList = userEmails.filter((e2) => e2.userId === req.params.userId);
   res.json(userList);
 });
 app.patch("/api/user-emails/:id/read", (req, res) => {
+  const authUserId = resolveUserId(req);
   const em = userEmails.find((e2) => e2.id === req.params.id);
-  if (em) em.read = true;
+  if (!em) return res.status(404).json({ error: "Notification not found" });
+  const caller = users.find((u) => u.id === authUserId);
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || ADMIN_TOKEN && req.headers.authorization;
+  if (!isAdmin && em.userId !== authUserId) {
+    return res.status(403).json({ error: "Unauthorized." });
+  }
+  em.read = true;
   res.json({ success: true });
 });
 app.post("/api/support-tickets", (req, res) => {
-  const { userId, userName, subject, text, priority = "medium" } = req.body;
+  const authUserId = resolveUserId(req);
+  const caller = users.find((u) => u.id === authUserId);
+  const { subject, text, priority = "medium" } = req.body;
+  const userId = caller?.id || req.body.userId || "user_1";
+  const userName = caller?.name || req.body.userName || "Elena Rostova";
   const newTicket = {
     id: "tick_" + Date.now(),
-    userId: userId || "user_1",
-    userName: userName || "Elena Rostova",
+    userId,
+    userName,
     subject: subject || "General Support Query",
     priority,
     status: "open",
     createdAt: (/* @__PURE__ */ new Date()).toISOString().split("T")[0],
     messages: [
-      { sender: userName || "Elena Rostova", text: text || "I need support assistance regarding my account.", timestamp: (/* @__PURE__ */ new Date()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) }
+      { sender: userName, text: text || "I need support assistance regarding my account.", timestamp: (/* @__PURE__ */ new Date()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) }
     ]
   };
   supportTickets.unshift(newTicket);
   auditLogs.unshift({
     id: "log_" + Date.now(),
-    actor: userName || "User",
-    role: "user",
+    actor: userName,
+    role: caller?.role || "user",
     action: "SUPPORT_TICKET_OPENED",
     target: `Ticket #${newTicket.id}`,
     details: `User submitted support request: ${subject}`,
@@ -72056,15 +72154,32 @@ app.post("/api/support-tickets", (req, res) => {
   res.json(newTicket);
 });
 app.get("/api/messages/:orderId", (req, res) => {
+  const authUserId = resolveUserId(req);
+  const order = orders.find((o) => o.id === req.params.orderId);
+  const caller = users.find((u) => u.id === authUserId);
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || ADMIN_TOKEN && req.headers.authorization;
+  if (!isAdmin && order && order.buyerId !== authUserId && order.sellerId !== authUserId) {
+    return res.status(403).json({ error: "Unauthorized: Cannot view messages for an order you do not belong to." });
+  }
   const filtered = messages.filter((m2) => m2.orderId === req.params.orderId);
   res.json(filtered);
 });
 app.post("/api/messages", (req, res) => {
+  const authUserId = resolveUserId(req);
+  const caller = users.find((u) => u.id === authUserId);
+  if (!caller) return res.status(401).json({ error: "Authentication required" });
+  const orderId = req.body.orderId;
+  const order = orders.find((o) => o.id === orderId);
+  if (!order) return res.status(404).json({ error: "Order not found" });
+  const isAdmin = caller.role === "admin" || caller.role === "super_admin";
+  if (!isAdmin && order.buyerId !== authUserId && order.sellerId !== authUserId) {
+    return res.status(403).json({ error: "Unauthorized: Cannot send messages to an order you are not part of." });
+  }
   const newMsg = {
     id: "msg_" + Date.now(),
-    orderId: req.body.orderId,
-    senderId: req.body.senderId || "user_2",
-    senderName: req.body.senderName || "Marcus Vance",
+    orderId,
+    senderId: caller.id,
+    senderName: caller.name,
     text: req.body.text,
     timestamp: (/* @__PURE__ */ new Date()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
   };
@@ -72072,13 +72187,16 @@ app.post("/api/messages", (req, res) => {
   res.json(newMsg);
 });
 app.post("/api/gigs", (req, res) => {
+  const authUserId = resolveUserId(req);
+  const caller = users.find((u) => u.id === authUserId);
+  if (!caller) return res.status(401).json({ error: "Authentication required" });
   const newGig = {
     id: "gig_" + Date.now(),
-    freelancerId: req.body.freelancerId || "user_1",
-    freelancerName: req.body.freelancerName || "Elena Rostova",
-    freelancerUsername: req.body.freelancerUsername || "elena_rostova",
-    freelancerAvatar: req.body.freelancerAvatar || "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=400&h=400&fit=crop",
-    freelancerLevel: req.body.freelancerLevel || "Level 1 \u2605",
+    freelancerId: caller.id,
+    freelancerName: caller.name,
+    freelancerUsername: caller.username || caller.name.toLowerCase().replace(/\s+/g, "_"),
+    freelancerAvatar: caller.avatar,
+    freelancerLevel: "Level 1 \u2605",
     title: req.body.title,
     slug: req.body.title ? req.body.title.toLowerCase().trim().replace(/[^\w\s-]/g, "").replace(/[\s_-]+/g, "-").replace(/^-+|-+$/g, "") : "custom-gig",
     category: req.body.category || "Development & IT",
@@ -72097,11 +72215,14 @@ app.post("/api/gigs", (req, res) => {
   res.json(newGig);
 });
 app.post("/api/projects", (req, res) => {
+  const authUserId = resolveUserId(req);
+  const caller = users.find((u) => u.id === authUserId);
+  if (!caller) return res.status(401).json({ error: "Authentication required" });
   const newProj = {
     id: "proj_" + Date.now(),
-    buyerId: req.body.buyerId || "user_2",
-    buyerName: req.body.buyerName || "Marcus Vance",
-    buyerAvatar: req.body.buyerAvatar || "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400&h=400&fit=crop",
+    buyerId: caller.id,
+    buyerName: caller.name,
+    buyerAvatar: caller.avatar,
     title: req.body.title,
     category: req.body.category || "Development & IT",
     subcategory: req.body.subcategory || "General",
@@ -72261,13 +72382,16 @@ app.delete("/api/admin/gigs/:id", (req, res) => {
   res.json({ success: true, id: deleted.id });
 });
 app.post("/api/proposals", (req, res) => {
+  const authUserId = resolveUserId(req);
+  const caller = users.find((u) => u.id === authUserId);
+  if (!caller) return res.status(401).json({ error: "Authentication required" });
   const newProp = {
     id: "prop_" + Date.now(),
     projectId: req.body.projectId,
-    freelancerId: req.body.freelancerId || "user_1",
-    freelancerName: req.body.freelancerName || "Elena Rostova",
-    freelancerAvatar: req.body.freelancerAvatar || "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=400&h=400&fit=crop",
-    freelancerTitle: req.body.freelancerTitle || "Senior Engineer",
+    freelancerId: caller.id,
+    freelancerName: caller.name,
+    freelancerAvatar: caller.avatar,
+    freelancerTitle: caller.title || "Senior Engineer",
     coverLetter: req.body.coverLetter,
     bidAmount: Number(req.body.bidAmount),
     deliveryDays: Number(req.body.deliveryDays),
@@ -72281,13 +72405,16 @@ app.post("/api/proposals", (req, res) => {
 });
 app.post("/api/orders", rateLimit(30, 6e4), (req, res) => {
   try {
+    const authUserId = resolveUserId(req);
+    const caller = users.find((u) => u.id === authUserId);
+    if (!caller) return res.status(401).json({ error: "Authentication required" });
     const title = typeof req.body?.title === "string" ? req.body.title.trim() : "";
     if (title.length < 3) return res.status(400).json({ error: "A valid order title is required." });
-    const buyerId = String(req.body?.buyerId || "");
+    const buyerId = caller.id;
     const sellerId = String(req.body?.sellerId || "");
-    const buyer = users.find((u) => u.id === buyerId);
+    const buyer = caller;
     const seller = users.find((u) => u.id === sellerId);
-    if (!buyer || !seller) return res.status(404).json({ error: "Buyer or seller not found." });
+    if (!seller) return res.status(404).json({ error: "Seller not found." });
     if (buyerId === sellerId) return res.status(400).json({ error: "You cannot order from yourself." });
     ensureWallet(buyerId);
     ensureWallet(sellerId);

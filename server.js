@@ -68668,7 +68668,7 @@ function getApiKeyFromEnv() {
 
 // server.ts
 var import_dotenv = __toESM(require_main(), 1);
-import { randomUUID as randomUUID2 } from "crypto";
+import { randomUUID as randomUUID2, timingSafeEqual, createHmac } from "crypto";
 
 // src/server/financeLedger.ts
 import { randomUUID } from "node:crypto";
@@ -69831,21 +69831,74 @@ financeLedger.configure({
   minimumWithdrawalAmount: DEFAULT_SITE_SETTINGS.wallets.minimumWithdrawalAmount,
   maximumWithdrawalAmount: DEFAULT_SITE_SETTINGS.wallets.maximumWithdrawalPerTransaction
 });
-function resolveAuthenticatedUserId(req) {
-  const authUser = req.user?.id || req.user?.uid;
-  if (authUser && typeof authUser === "string" && authUser.trim()) return authUser.trim();
+var JWT_SECRET = process.env.JWT_SECRET || randomUUID2() + randomUUID2();
+function signToken(payload, expiresInMs = 7 * 24 * 3600 * 1e3) {
+  const data = JSON.stringify({ ...payload, exp: Date.now() + expiresInMs });
+  const base64Data = Buffer.from(data).toString("base64url");
+  const signature = createHmac("sha256", JWT_SECRET).update(base64Data).digest("base64url");
+  return `${base64Data}.${signature}`;
+}
+function verifyToken(token) {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 2) return null;
+    const [base64Data, signature] = parts;
+    const expectedSig = createHmac("sha256", JWT_SECRET).update(base64Data).digest("base64url");
+    const sigBuf = Buffer.from(signature);
+    const expBuf = Buffer.from(expectedSig);
+    if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) {
+      return null;
+    }
+    const payload = JSON.parse(Buffer.from(base64Data, "base64url").toString("utf-8"));
+    if (payload.exp && payload.exp < Date.now()) {
+      return null;
+    }
+    return payload;
+  } catch {
+    return null;
+  }
+}
+function verifyAuthTokenMiddleware(req, res, next) {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith("Bearer ")) {
     const token = authHeader.slice(7).trim();
-    const found = users.find((u) => u.id === token || u.email === token || token === "admin_token_" + u.id);
-    if (found) return found.id;
     if (token === ADMIN_TOKEN || token === "test_admin_token") {
-      return "user_admin";
+      req.user = { id: "user_admin", role: "super_admin", email: "admin@workperhour.com" };
+      return next();
+    }
+    const payload = verifyToken(token);
+    if (payload) {
+      req.user = payload;
     }
   }
+  next();
+}
+app.use(verifyAuthTokenMiddleware);
+function resolveAuthenticatedUserId(req) {
+  const authUser = req.user?.id || req.user?.uid;
+  if (authUser && typeof authUser === "string" && authUser.trim()) return authUser.trim();
   return null;
 }
 var resolveUserId = resolveAuthenticatedUserId;
+app.post("/api/auth/login", (req, res) => {
+  const { userId, email } = req.body || {};
+  const user = users.find((u) => u.id === userId || u.email === email);
+  if (!user) {
+    return res.status(401).json({ error: "Invalid credentials or user not found" });
+  }
+  const token = signToken({ id: user.id, role: user.role, email: user.email });
+  res.json({
+    success: true,
+    token,
+    user: {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      avatar: user.avatar
+    }
+  });
+});
 function requireAuth(req, res, next) {
   const userId = resolveAuthenticatedUserId(req);
   if (!userId) {
@@ -71021,17 +71074,24 @@ app.post("/api/orders/:id/force-cancel", (req, res) => {
     res.status(400).json({ error: err.message });
   }
 });
-app.post("/api/orders/:id/message", (req, res) => {
+app.post("/api/orders/:id/message", requireAuth, (req, res) => {
   const order = orders.find((o) => o.id === req.params.id);
   if (!order) return res.status(404).json({ error: "Order not found" });
-  if (order.isMuted && req.body.senderRole !== "admin") {
+  const userId = req.authenticatedUserId;
+  const user = users.find((u) => u.id === userId);
+  if (!user) return res.status(401).json({ error: "User not found" });
+  const isAuthorized = order.buyerId === userId || order.sellerId === userId || user.role === "admin" || user.role === "super_admin" || user.role === "support";
+  if (!isAuthorized) {
+    return res.status(403).json({ error: "Unauthorized to send messages in this order" });
+  }
+  if (order.isMuted && user.role !== "admin" && user.role !== "super_admin" && user.role !== "support") {
     return res.status(403).json({ error: "Chat is currently muted by Administrator." });
   }
   const newMsg = {
     id: "msg_" + Date.now(),
     orderId: order.id,
-    senderId: req.body.senderId || "user_admin",
-    senderName: req.body.senderName || "Platform Support Desk",
+    senderId: user.id,
+    senderName: user.name,
     text: req.body.text,
     timestamp: (/* @__PURE__ */ new Date()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
   };
@@ -71039,8 +71099,10 @@ app.post("/api/orders/:id/message", (req, res) => {
   try {
     const payload = JSON.stringify({ type: "MESSAGE_RECEIVED", message: newMsg });
     for (const client of clients) {
-      if (client.readyState === import_websocket.default.OPEN) {
-        client.send(payload);
+      if (client.authenticatedUserId === user.id || client.orderId === order.id) {
+        if (client.readyState === import_websocket.default.OPEN) {
+          client.send(payload);
+        }
       }
     }
   } catch (err) {
@@ -71434,9 +71496,16 @@ app.get("/api/payments/transactions/:userId", requireAuth, (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-app.get("/api/payments/invoices/:userId", (req, res) => {
+app.get("/api/payments/invoices/:userId", requireAuth, (req, res) => {
   try {
-    const userId = req.params.userId;
+    const authenticatedUserId = req.authenticatedUserId;
+    const requestedUserId = req.params.userId;
+    const user = users.find((u) => u.id === authenticatedUserId);
+    if (!user) return res.status(401).json({ error: "User not found" });
+    if (authenticatedUserId !== requestedUserId && user.role !== "admin" && user.role !== "super_admin" && user.role !== "support") {
+      return res.status(403).json({ error: "Unauthorized: You can only access your own invoices" });
+    }
+    const userId = requestedUserId;
     const userOrders = orders.filter((o) => o.buyerId === userId || o.sellerId === userId);
     const orderInvoices = userOrders.map((o) => {
       const isBuyer = o.buyerId === userId;
@@ -71471,9 +71540,10 @@ app.get("/api/payments/invoices/:userId", (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-app.post("/api/payments/invoices", (req, res) => {
+app.post("/api/payments/invoices", requireAuth, (req, res) => {
   try {
-    const { userId, recipientName, recipientEmail, title, dueDate, items, notes } = req.body;
+    const authenticatedUserId = req.authenticatedUserId;
+    const { recipientName, recipientEmail, title, dueDate, items, notes } = req.body;
     if (!title || !recipientName) {
       return res.status(400).json({ error: "Title and recipient name are required" });
     }
@@ -71484,7 +71554,8 @@ app.post("/api/payments/invoices", (req, res) => {
     const newInvoice = {
       id: "inv_" + Date.now(),
       invoiceNumber: `INV-${Date.now().toString().slice(-6)}`,
-      userId,
+      userId: authenticatedUserId,
+      // Set from auth, not request body
       recipientName,
       recipientEmail: recipientEmail || "client@example.com",
       title,
@@ -71499,15 +71570,15 @@ app.post("/api/payments/invoices", (req, res) => {
       notes: notes || "Standard WorkPerHour Invoice"
     };
     customInvoices.unshift(newInvoice);
-    res.json(newInvoice);
+    res.status(201).json(newInvoice);
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
-app.get("/api/payments/methods/:userId", (req, res) => {
-  const authUserId = resolveUserId(req);
+app.get("/api/payments/methods/:userId", requireAuth, (req, res) => {
+  const authUserId = req.authenticatedUserId;
   const caller = users.find((u) => u.id === authUserId);
-  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || ADMIN_TOKEN && req.headers.authorization;
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || caller?.role === "support";
   if (!isAdmin && authUserId !== req.params.userId) {
     return res.status(403).json({ error: "Unauthorized: Cannot view another user payment methods." });
   }
@@ -71521,19 +71592,13 @@ app.get("/api/payments/methods/:userId", (req, res) => {
   }));
   res.json(sanitized);
 });
-app.post("/api/payments/methods", (req, res) => {
+app.post("/api/payments/methods", requireAuth, (req, res) => {
   try {
-    const authUserId = resolveUserId(req);
+    const authUserId = req.authenticatedUserId;
     const { type, name, details, isDefault } = req.body;
-    const targetUserId = req.body.userId || authUserId;
-    const caller = users.find((u) => u.id === authUserId);
-    const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || ADMIN_TOKEN && req.headers.authorization;
-    if (!isAdmin && authUserId !== targetUserId) {
-      return res.status(403).json({ error: "Unauthorized: Cannot add payment method to another user account." });
-    }
-    const userId = targetUserId;
+    const userId = authUserId;
     if (!userId || !type || !name) {
-      return res.status(400).json({ error: "User ID, method type, and name are required" });
+      return res.status(400).json({ error: "Method type and name are required" });
     }
     if (isDefault) {
       savedPaymentMethods.forEach((m2) => {
@@ -71555,12 +71620,12 @@ app.post("/api/payments/methods", (req, res) => {
     res.status(400).json({ error: err.message });
   }
 });
-app.delete("/api/payments/methods/:id", (req, res) => {
-  const authUserId = resolveUserId(req);
+app.delete("/api/payments/methods/:id", requireAuth, (req, res) => {
+  const authUserId = req.authenticatedUserId;
   const method = savedPaymentMethods.find((m2) => m2.id === req.params.id);
   if (!method) return res.status(404).json({ error: "Payment method not found" });
   const caller = users.find((u) => u.id === authUserId);
-  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || ADMIN_TOKEN && req.headers.authorization;
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || caller?.role === "support";
   if (!isAdmin && method.userId !== authUserId) {
     return res.status(403).json({ error: "Unauthorized: Cannot delete another user payment method." });
   }
@@ -71568,12 +71633,12 @@ app.delete("/api/payments/methods/:id", (req, res) => {
   savedPaymentMethods.splice(index, 1);
   res.json({ success: true, id: req.params.id });
 });
-app.patch("/api/payments/methods/:id/default", (req, res) => {
-  const authUserId = resolveUserId(req);
+app.patch("/api/payments/methods/:id/default", requireAuth, (req, res) => {
+  const authUserId = req.authenticatedUserId;
   const method = savedPaymentMethods.find((m2) => m2.id === req.params.id);
   if (!method) return res.status(404).json({ error: "Payment method not found" });
   const caller = users.find((u) => u.id === authUserId);
-  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || ADMIN_TOKEN && req.headers.authorization;
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || caller?.role === "support";
   if (!isAdmin && method.userId !== authUserId) {
     return res.status(403).json({ error: "Unauthorized." });
   }
@@ -72133,12 +72198,13 @@ app.patch("/api/user-emails/:id/read", (req, res) => {
   em.read = true;
   res.json({ success: true });
 });
-app.post("/api/support-tickets", (req, res) => {
-  const authUserId = resolveUserId(req);
+app.post("/api/support-tickets", requireAuth, (req, res) => {
+  const authUserId = req.authenticatedUserId;
   const caller = users.find((u) => u.id === authUserId);
+  if (!caller) return res.status(401).json({ error: "User not found" });
   const { subject, text, priority = "medium" } = req.body;
-  const userId = caller?.id || req.body.userId || "user_1";
-  const userName = caller?.name || req.body.userName || "Elena Rostova";
+  const userId = caller.id;
+  const userName = caller.name;
   const newTicket = {
     id: "tick_" + Date.now(),
     userId,
@@ -72155,7 +72221,7 @@ app.post("/api/support-tickets", (req, res) => {
   auditLogs.unshift({
     id: "log_" + Date.now(),
     actor: userName,
-    role: caller?.role || "user",
+    role: caller.role,
     action: "SUPPORT_TICKET_OPENED",
     target: `Ticket #${newTicket.id}`,
     details: `User submitted support request: ${subject}`,
@@ -72714,17 +72780,35 @@ Return ONLY valid JSON with structure:
   }
 });
 var clients = /* @__PURE__ */ new Set();
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const token = url.searchParams.get("token");
+  if (token) {
+    const payload = verifyToken(token);
+    if (payload) {
+      ws.authenticatedUserId = payload.id;
+    }
+  }
   clients.add(ws);
   ws.on("message", (data) => {
     try {
       const parsed = JSON.parse(data.toString());
       if (parsed.type === "NEW_MESSAGE") {
+        const userId = ws.authenticatedUserId;
+        if (!userId) {
+          console.error("WS: Unauthenticated message attempt");
+          return;
+        }
+        const user = users.find((u) => u.id === userId);
+        const order = orders.find((o) => o.id === parsed.orderId);
+        if (!order || !user) return;
+        const isAuthorized = order.buyerId === userId || order.sellerId === userId || user.role === "admin" || user.role === "super_admin" || user.role === "support";
+        if (!isAuthorized) return;
         const newMsg = {
           id: "msg_" + Date.now(),
-          orderId: parsed.orderId,
-          senderId: parsed.senderId,
-          senderName: parsed.senderName,
+          orderId: order.id,
+          senderId: user.id,
+          senderName: user.name,
           text: parsed.text,
           timestamp: (/* @__PURE__ */ new Date()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
         };

@@ -69823,6 +69823,9 @@ var __dirname = path2.dirname(fileURLToPath(import.meta.url));
 var app = (0, import_express.default)();
 app.use(import_express.default.json({ limit: "100kb" }));
 var IS_PROD = process.env.NODE_ENV === "production";
+if (IS_PROD && !process.env.ADMIN_API_TOKEN) {
+  throw new Error("ADMIN_API_TOKEN must be set in production");
+}
 var ADMIN_TOKEN = process.env.ADMIN_API_TOKEN || "";
 var REQUIRE_KYC_FOR_PAYOUTS = process.env.REQUIRE_KYC_FOR_PAYOUTS !== "false";
 financeLedger.configure({
@@ -70946,10 +70949,19 @@ app.get("/api/users", requireRole(["admin", "super_admin"]), (req, res) => {
 });
 app.get("/api/gigs", (req, res) => res.json(gigs));
 app.get("/api/projects", (req, res) => res.json(projects));
-app.get("/api/proposals", (req, res) => res.json(proposals));
-app.get("/api/orders", (req, res) => {
-  const enriched = orders.map(enrichOrderWithServiceInfo);
-  res.json(enriched);
+app.get("/api/proposals", requireAuth, (req, res) => {
+  const authUserId = req.authenticatedUserId;
+  const caller = users.find((u) => u.id === authUserId);
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || caller?.role === "support";
+  const userProposals = proposals.filter((p) => isAdmin || p.freelancerId === authUserId);
+  res.json(userProposals);
+});
+app.get("/api/orders", requireAuth, (req, res) => {
+  const authUserId = req.authenticatedUserId;
+  const caller = users.find((u) => u.id === authUserId);
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || caller?.role === "support";
+  const userOrders = orders.filter((o) => isAdmin || o.buyerId === authUserId || o.sellerId === authUserId);
+  res.json(userOrders.map(enrichOrderWithServiceInfo));
 });
 app.get("/api/orders/:id", requireAuth, (req, res) => {
   const order = orders.find((o) => o.id === req.params.id);
@@ -70967,8 +70979,8 @@ app.get("/api/orders/:id", requireAuth, (req, res) => {
   const dispute = disputes.find((d) => d.orderId === order.id);
   res.json({
     ...enriched,
-    buyer,
-    seller,
+    buyer: buyer ? safeUser(buyer) : null,
+    seller: seller ? safeUser(seller) : null,
     messages: orderMessages,
     dispute
   });
@@ -71013,9 +71025,15 @@ app.post("/api/orders/:id/admin-notes", (req, res) => {
   order.adminNotes = req.body.notes || "";
   res.json({ success: true, adminNotes: order.adminNotes });
 });
-app.post("/api/orders/:id/deliverable", (req, res) => {
+app.post("/api/orders/:id/deliverable", requireAuth, (req, res) => {
   const order = orders.find((o) => o.id === req.params.id);
   if (!order) return res.status(404).json({ error: "Order not found" });
+  const authUserId = req.authenticatedUserId;
+  const caller = users.find((u) => u.id === authUserId);
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || caller?.role === "support";
+  if (!isAdmin && order.sellerId !== authUserId) {
+    return res.status(403).json({ error: "Unauthorized: Only seller can upload deliverables." });
+  }
   if (!order.deliverableFiles) order.deliverableFiles = [];
   const newFile = {
     id: "deliv_" + Date.now(),
@@ -71039,7 +71057,7 @@ app.post("/api/orders/:id/deliverable", (req, res) => {
   messages.push(sysMsg);
   res.json({ success: true, file: newFile, order: enrichOrderWithServiceInfo(order) });
 });
-app.patch("/api/orders/:id/mute", (req, res) => {
+app.patch("/api/orders/:id/mute", requireRole(["admin", "super_admin", "support"]), (req, res) => {
   const order = orders.find((o) => o.id === req.params.id);
   if (!order) return res.status(404).json({ error: "Order not found" });
   order.isMuted = !order.isMuted;
@@ -71054,7 +71072,7 @@ app.patch("/api/orders/:id/mute", (req, res) => {
   messages.push(sysMsg);
   res.json({ success: true, isMuted: order.isMuted });
 });
-app.patch("/api/orders/:id/pause-timer", (req, res) => {
+app.patch("/api/orders/:id/pause-timer", requireRole(["admin", "super_admin", "support"]), (req, res) => {
   const order = orders.find((o) => o.id === req.params.id);
   if (!order) return res.status(404).json({ error: "Order not found" });
   order.isTimerPaused = !order.isTimerPaused;
@@ -71156,7 +71174,17 @@ app.post("/api/orders/:id/message", requireAuth, (req, res) => {
   broadcastMessage(newMsg, order.id);
   res.json({ success: true, message: newMsg });
 });
-app.get("/api/disputes", (req, res) => res.json(disputes));
+app.get("/api/disputes", requireAuth, (req, res) => {
+  const authUserId = req.authenticatedUserId;
+  const caller = users.find((u) => u.id === authUserId);
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || caller?.role === "support";
+  const userDisputes = disputes.filter((d) => {
+    if (isAdmin) return true;
+    const order = orders.find((o) => o.id === d.orderId);
+    return order && (order.buyerId === authUserId || order.sellerId === authUserId);
+  });
+  res.json(userDisputes);
+});
 app.get("/api/refunds", (req, res) => res.json(refunds));
 app.get("/api/payouts", (req, res) => res.json(payouts));
 app.get("/api/categories", (req, res) => res.json(categories));
@@ -72799,7 +72827,7 @@ app.post("/api/admin/tickets/:id/reply", (req, res) => {
   t2.status = "in_progress";
   res.json(t2);
 });
-app.post("/api/ai/proposal", async (req, res) => {
+app.post("/api/ai/proposal", requireAuth, rateLimit(5, 6e4), async (req, res) => {
   try {
     const { projectTitle, projectDescription, freelancerTitle, freelancerSkills } = req.body;
     const response = await ai.models.generateContent({
@@ -72816,7 +72844,7 @@ Keep it engaging, professional, persuasive, concise (under 180 words), highlight
     res.status(500).json({ error: err.message || "AI generation failed" });
   }
 });
-app.post("/api/ai/optimize-gig", async (req, res) => {
+app.post("/api/ai/optimize-gig", requireAuth, rateLimit(5, 6e4), async (req, res) => {
   try {
     const { title, description } = req.body;
     const response = await ai.models.generateContent({

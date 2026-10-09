@@ -74,7 +74,7 @@ function verifyAuthTokenMiddleware(req: Request, res: Response, next: NextFuncti
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.slice(7).trim();
 
-    if (token === ADMIN_TOKEN || token === 'test_admin_token') {
+    if (token === ADMIN_TOKEN) {
       (req as any).user = { id: 'user_admin', role: 'super_admin', email: 'admin@workperhour.com' };
       return next();
     }
@@ -100,8 +100,8 @@ const resolveUserId = resolveAuthenticatedUserId;
 
 // Authentication Login Endpoint to issue verified signed JWT tokens
 app.post('/api/auth/login', (req, res) => {
-  const { userId, email } = req.body || {};
-  const user = users.find(u => u.id === userId || u.email === email);
+  const { userId, email, password } = req.body || {};
+  const user = users.find(u => (u.id === userId || u.email === email) && u.password === password);
   if (!user) {
     return res.status(401).json({ error: 'Invalid credentials or user not found' });
   }
@@ -239,6 +239,7 @@ interface User {
   createdAt: string;
   isFlagged?: boolean;
   flagReason?: string;
+  password?: string;
 }
 
 interface GigExtra {
@@ -519,7 +520,8 @@ let users: User[] = [
     status: 'active',
     verified: true,
     walletBalance: 4250,
-    createdAt: '2025-01-15'
+    createdAt: '2025-01-15',
+    password: 'password123'
   },
   {
     id: 'user_2',
@@ -538,7 +540,8 @@ let users: User[] = [
     status: 'active',
     verified: true,
     walletBalance: 12000,
-    createdAt: '2025-02-01'
+    createdAt: '2025-02-01',
+    password: 'password123'
   },
   {
     id: 'user_admin',
@@ -557,7 +560,8 @@ let users: User[] = [
     status: 'active',
     verified: true,
     walletBalance: 0,
-    createdAt: '2025-01-01'
+    createdAt: '2025-01-01',
+    password: 'adminpassword123'
   },
   {
     id: 'user_bk',

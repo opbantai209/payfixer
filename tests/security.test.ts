@@ -29,12 +29,12 @@ async function run() {
 
   try {
     // Obtain real cryptographically signed JWT tokens via login
-    const login1 = await api('/api/auth/login', { method: 'POST', body: { userId: 'user_1' } });
+    const login1 = await api('/api/auth/login', { method: 'POST', body: { userId: 'user_1', password: 'password123' } });
     assert.strictEqual(login1.status, 200, 'Login user_1 failed');
     const token1 = login1.json.token;
     assert.ok(token1, 'JWT token returned for user_1');
 
-    const login2 = await api('/api/auth/login', { method: 'POST', body: { userId: 'user_2' } });
+    const login2 = await api('/api/auth/login', { method: 'POST', body: { userId: 'user_2', password: 'password123' } });
     assert.strictEqual(login2.status, 200, 'Login user_2 failed');
     const token2 = login2.json.token;
     assert.ok(token2, 'JWT token returned for user_2');

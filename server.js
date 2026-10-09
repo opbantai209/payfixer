@@ -69925,10 +69925,11 @@ function ALLOWED_ROLES_CHECK(role, allowed) {
 }
 function requireRole(allowedRoles) {
   return (req, res, next) => {
-    if (ADMIN_TOKEN && req.headers.authorization) {
-      const header = String(req.headers.authorization || "");
+    if (req.headers.authorization) {
+      const header = String(req.headers.authorization);
       const given = header.startsWith("Bearer ") ? header.slice(7) : "";
-      if (given && given === ADMIN_TOKEN) return next();
+      if (ADMIN_TOKEN && given === ADMIN_TOKEN) return next();
+      return res.status(401).json({ error: "Invalid authentication token" });
     }
     const userId = resolveAuthenticatedUserId(req);
     const u = users.find((user) => user.id === userId);
@@ -69944,18 +69945,14 @@ function requireAdmin(req, res, next) {
     const header = String(req.headers.authorization || "");
     const given = header.startsWith("Bearer ") ? header.slice(7) : "";
     if (given && given === ADMIN_TOKEN) return next();
+    return res.status(401).json({ error: "Invalid authentication token" });
   }
   const userId = resolveAuthenticatedUserId(req);
   const u = users.find((user) => user.id === userId);
   if (u && (u.role === "admin" || u.role === "super_admin")) {
     return next();
   }
-  if (!ADMIN_TOKEN) {
-    if (IS_PROD) return res.status(503).json({ error: "ADMIN_API_TOKEN is not configured; admin endpoints are disabled." });
-    if (u && (u.role === "admin" || u.role === "super_admin")) return next();
-    return res.status(403).json({ error: "Admin authorization required." });
-  }
-  return res.status(401).json({ error: "Admin authorization required." });
+  return res.status(401).json({ error: "Access denied" });
 }
 var rateBuckets = /* @__PURE__ */ new Map();
 function rateLimit(max, windowMs) {
@@ -69975,7 +69972,23 @@ app.use("/api/admin", requireAdmin);
 for (const sub of ["force-complete", "force-cancel", "admin-notes", "extend-time", "mute"]) {
   app.use(`/api/orders/:id/${sub}`, requireAdmin);
 }
-app.use(["/api/payouts", "/api/refunds", "/api/audit-logs"], (req, res, next) => req.method === "GET" ? requireAdmin(req, res, next) : next());
+app.use(["/api/payouts", "/api/refunds", "/api/audit-logs"], (req, res, next) => {
+  if (req.method === "GET") {
+    if (!req.headers.authorization && !resolveAuthenticatedUserId(req)) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+    const userId = resolveAuthenticatedUserId(req);
+    const u = users.find((user) => user.id === userId);
+    if (req.headers.authorization && ADMIN_TOKEN) {
+      return requireAdmin(req, res, next);
+    }
+    if (u && (u.role === "admin" || u.role === "super_admin")) {
+      return requireAdmin(req, res, next);
+    }
+    return res.status(401).json({ error: "Access denied" });
+  }
+  return next();
+});
 var server = createServer(app);
 var wss = new import_websocket_server.default({ server });
 var ai = new GoogleGenAI2({
@@ -71119,18 +71132,7 @@ app.post("/api/orders/:id/message", requireAuth, (req, res) => {
     timestamp: (/* @__PURE__ */ new Date()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
   };
   messages.push(newMsg);
-  try {
-    const payload = JSON.stringify({ type: "MESSAGE_RECEIVED", message: newMsg });
-    for (const client of clients) {
-      if (client.authenticatedUserId === user.id || client.orderId === order.id) {
-        if (client.readyState === import_websocket.default.OPEN) {
-          client.send(payload);
-        }
-      }
-    }
-  } catch (err) {
-    console.error("WS broadcast error:", err);
-  }
+  broadcastMessage(newMsg, order.id);
   res.json({ success: true, message: newMsg });
 });
 app.get("/api/disputes", (req, res) => res.json(disputes));
@@ -72197,12 +72199,22 @@ app.delete("/api/admin/categories/:id/subcategories/:subId", (req, res) => {
   res.json(categories);
 });
 app.get("/api/reviews", (req, res) => res.json(reviews));
-app.get("/api/support-tickets", requireRole(["admin", "super_admin", "support"]), (req, res) => res.json(supportTickets));
-app.get("/api/audit-logs", (req, res) => res.json(auditLogs));
+app.get("/api/support-tickets", requireAuth, (req, res) => {
+  const authUserId = req.authenticatedUserId;
+  const caller = users.find((u) => u.id === authUserId);
+  if (!caller) return res.status(401).json({ error: "User not found" });
+  const isAdmin = caller.role === "admin" || caller.role === "super_admin" || caller.role === "support";
+  if (isAdmin) {
+    res.json(supportTickets);
+  } else {
+    res.json(supportTickets.filter((t2) => t2.userId === authUserId));
+  }
+});
+app.get("/api/audit-logs", requireRole(["admin", "super_admin"]), (req, res) => res.json(auditLogs));
 app.get("/api/user-emails/:userId", (req, res) => {
   const authUserId = resolveUserId(req);
   const caller = users.find((u) => u.id === authUserId);
-  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || ADMIN_TOKEN && req.headers.authorization;
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || req.headers.authorization && ADMIN_TOKEN && String(req.headers.authorization).replace("Bearer ", "") === ADMIN_TOKEN;
   if (!isAdmin && authUserId !== req.params.userId) {
     return res.status(403).json({ error: "Unauthorized: Cannot view another user email notifications." });
   }
@@ -72214,7 +72226,7 @@ app.patch("/api/user-emails/:id/read", (req, res) => {
   const em = userEmails.find((e2) => e2.id === req.params.id);
   if (!em) return res.status(404).json({ error: "Notification not found" });
   const caller = users.find((u) => u.id === authUserId);
-  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || ADMIN_TOKEN && req.headers.authorization;
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || req.headers.authorization && ADMIN_TOKEN && String(req.headers.authorization).replace("Bearer ", "") === ADMIN_TOKEN;
   if (!isAdmin && em.userId !== authUserId) {
     return res.status(403).json({ error: "Unauthorized." });
   }
@@ -72256,7 +72268,7 @@ app.get("/api/messages/:orderId", (req, res) => {
   const authUserId = resolveUserId(req);
   const order = orders.find((o) => o.id === req.params.orderId);
   const caller = users.find((u) => u.id === authUserId);
-  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || ADMIN_TOKEN && req.headers.authorization;
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || req.headers.authorization && ADMIN_TOKEN && String(req.headers.authorization).replace("Bearer ", "") === ADMIN_TOKEN;
   if (!isAdmin && order && order.buyerId !== authUserId && order.sellerId !== authUserId) {
     return res.status(403).json({ error: "Unauthorized: Cannot view messages for an order you do not belong to." });
   }
@@ -72802,6 +72814,21 @@ Return ONLY valid JSON with structure:
     res.status(500).json({ error: err.message || "AI optimization failed" });
   }
 });
+function broadcastMessage(message, orderId) {
+  const payload = JSON.stringify({ type: "MESSAGE_RECEIVED", message });
+  const order = orders.find((o) => o.id === orderId);
+  if (!order) return;
+  for (const client of clients) {
+    const clientUserId = client.authenticatedUserId;
+    if (clientUserId) {
+      const clientUser = users.find((u) => u.id === clientUserId);
+      const isAuthorized = clientUser && (["admin", "super_admin", "support"].includes(clientUser.role) || clientUserId === order.buyerId || clientUserId === order.sellerId);
+      if (isAuthorized && client.readyState === import_websocket.default.OPEN) {
+        client.send(payload);
+      }
+    }
+  }
+}
 var clients = /* @__PURE__ */ new Set();
 wss.on("connection", (ws, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -72840,17 +72867,7 @@ wss.on("connection", (ws, req) => {
           timestamp: (/* @__PURE__ */ new Date()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
         };
         messages.push(newMsg);
-        const payload2 = JSON.stringify({ type: "MESSAGE_RECEIVED", message: newMsg });
-        for (const client of clients) {
-          const clientUserId = client.authenticatedUserId;
-          if (clientUserId) {
-            const clientUser = users.find((u) => u.id === clientUserId);
-            const isAuthorized2 = clientUser && (["admin", "super_admin", "support"].includes(clientUser.role) || clientUserId === order.buyerId || clientUserId === order.sellerId);
-            if (isAuthorized2 && client.readyState === import_websocket.default.OPEN) {
-              client.send(payload2);
-            }
-          }
-        }
+        broadcastMessage(newMsg, order.id);
       }
     } catch (e2) {
       console.error("WS message error:", e2);

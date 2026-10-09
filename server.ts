@@ -1690,18 +1690,7 @@ app.post('/api/orders/:id/message', requireAuth, (req, res) => {
   messages.push(newMsg);
 
   // Broadcast WebSocket
-  try {
-    const payload = JSON.stringify({ type: 'MESSAGE_RECEIVED', message: newMsg });
-    for (const client of clients) {
-      if ((client as any).authenticatedUserId === user.id || (client as any).orderId === order.id) { // Simplified check for now
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(payload);
-        }
-      }
-    }
-  } catch (err) {
-    console.error('WS broadcast error:', err);
-  }
+  broadcastMessage(newMsg, order.id);
 
   res.json({ success: true, message: newMsg });
 });
@@ -3687,6 +3676,28 @@ Return ONLY valid JSON with structure:
 });
 
 // WebSocket Real-Time Chat Server
+function broadcastMessage(message: Message, orderId: string) {
+  const payload = JSON.stringify({ type: 'MESSAGE_RECEIVED', message });
+  const order = orders.find(o => o.id === orderId);
+  if (!order) return;
+
+  for (const client of clients) {
+    const clientUserId = (client as any).authenticatedUserId;
+    if (clientUserId) {
+      const clientUser = users.find(u => u.id === clientUserId);
+      const isAuthorized = clientUser && (
+        ['admin', 'super_admin', 'support'].includes(clientUser.role) ||
+        clientUserId === order.buyerId ||
+        clientUserId === order.sellerId
+      );
+      
+      if (isAuthorized && client.readyState === WebSocket.OPEN) {
+        client.send(payload);
+      }
+    }
+  }
+}
+
 const clients = new Set<WebSocket>();
 
 wss.on('connection', (ws, req) => {
@@ -3736,24 +3747,7 @@ wss.on('connection', (ws, req) => {
         };
         messages.push(newMsg);
 
-        const payload = JSON.stringify({ type: 'MESSAGE_RECEIVED', message: newMsg });
-        
-        // Broadcast WebSocket to authorized parties only
-        for (const client of clients) {
-          const clientUserId = (client as any).authenticatedUserId;
-          if (clientUserId) {
-            const clientUser = users.find(u => u.id === clientUserId);
-            const isAuthorized = clientUser && (
-              ['admin', 'super_admin', 'support'].includes(clientUser.role) ||
-              clientUserId === order.buyerId ||
-              clientUserId === order.sellerId
-            );
-            
-            if (isAuthorized && client.readyState === WebSocket.OPEN) {
-              client.send(payload);
-            }
-          }
-        }
+        broadcastMessage(newMsg, order.id);
       }
     } catch (e) {
       console.error('WS message error:', e);

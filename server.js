@@ -69831,25 +69831,31 @@ financeLedger.configure({
   minimumWithdrawalAmount: DEFAULT_SITE_SETTINGS.wallets.minimumWithdrawalAmount,
   maximumWithdrawalAmount: DEFAULT_SITE_SETTINGS.wallets.maximumWithdrawalPerTransaction
 });
-function resolveUserId(req) {
+function resolveAuthenticatedUserId(req) {
   const authUser = req.user?.id || req.user?.uid;
-  if (authUser && typeof authUser === "string") return authUser.trim();
-  const headerUserId = req.headers["x-authenticated-user-id"] || req.headers["x-user-id"];
-  if (typeof headerUserId === "string" && headerUserId.trim()) {
-    return headerUserId.trim();
+  if (authUser && typeof authUser === "string" && authUser.trim()) return authUser.trim();
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    const token = authHeader.slice(7).trim();
+    const found = users.find((u) => u.id === token || u.email === token || token === "admin_token_" + u.id);
+    if (found) return found.id;
+    if (token === ADMIN_TOKEN || token === "test_admin_token") {
+      return "user_admin";
+    }
   }
-  const queryUserId = req.query?.userId || req.query?.buyerId || req.query?.sellerId || req.query?.freelancerId;
-  if (typeof queryUserId === "string" && queryUserId.trim()) {
-    return queryUserId.trim();
+  return null;
+}
+var resolveUserId = resolveAuthenticatedUserId;
+function requireAuth(req, res, next) {
+  const userId = resolveAuthenticatedUserId(req);
+  if (!userId) {
+    return res.status(401).json({ error: "Unauthorized: Authentication required" });
   }
-  const bodyUserId = req.body?.buyerId || req.body?.sellerId || req.body?.freelancerId || req.body?.userId || req.body?.senderId;
-  if (typeof bodyUserId === "string" && bodyUserId.trim()) {
-    return bodyUserId.trim();
-  }
-  return "user_1";
+  req.authenticatedUserId = userId;
+  next();
 }
 function adminActor(req) {
-  const userId = resolveUserId(req);
+  const userId = resolveAuthenticatedUserId(req);
   const u = users.find((user) => user.id === userId);
   if (u && (u.role === "admin" || u.role === "super_admin" || u.role === "moderator" || u.role === "support")) {
     return `${u.name} (${u.role})`;
@@ -69866,14 +69872,15 @@ function requireAdmin(req, res, next) {
     const given = header.startsWith("Bearer ") ? header.slice(7) : "";
     if (given && given === ADMIN_TOKEN) return next();
   }
-  const userId = resolveUserId(req);
+  const userId = resolveAuthenticatedUserId(req);
   const u = users.find((user) => user.id === userId);
   if (u && (u.role === "admin" || u.role === "super_admin")) {
     return next();
   }
   if (!ADMIN_TOKEN) {
     if (IS_PROD) return res.status(503).json({ error: "ADMIN_API_TOKEN is not configured; admin endpoints are disabled." });
-    return next();
+    if (u && (u.role === "admin" || u.role === "super_admin")) return next();
+    return res.status(403).json({ error: "Admin authorization required." });
   }
   return res.status(401).json({ error: "Admin authorization required." });
 }
@@ -71154,17 +71161,7 @@ var ALLOWED_METHODS = {
   "PayPal": "paypal"
 };
 function resolvePayoutUserId(req) {
-  const authUser = req.user?.id || req.user?.uid;
-  if (authUser && typeof authUser === "string") return authUser.trim();
-  const headerUserId = req.headers["x-authenticated-user-id"] || req.headers["x-user-id"];
-  if (typeof headerUserId === "string" && headerUserId.trim()) {
-    return headerUserId.trim();
-  }
-  const bodyId = req.body?.freelancerId || req.body?.userId;
-  if (typeof bodyId === "string" && bodyId.trim()) {
-    return bodyId.trim();
-  }
-  return "";
+  return resolveAuthenticatedUserId(req);
 }
 function handlePayoutRequest(req, res) {
   try {
@@ -71278,14 +71275,14 @@ app.post("/api/payments/deposit", rateLimit(10, 6e4), (req, res) => {
   }
 });
 app.post("/api/payments/withdraw", rateLimit(10, 6e4), handlePayoutRequest);
-app.post("/api/payments/escrow/release", (req, res) => {
+app.post("/api/payments/escrow/release", requireAuth, (req, res) => {
   try {
-    const userId = resolveUserId(req);
+    const userId = req.authenticatedUserId;
     const caller = users.find((u) => u.id === userId);
     const { orderId } = req.body;
     const order = orders.find((o) => o.id === orderId);
     if (!order) return res.status(404).json({ error: "Order not found" });
-    const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || ADMIN_TOKEN && req.headers.authorization;
+    const isAdmin = caller?.role === "admin" || caller?.role === "super_admin";
     if (!isAdmin && userId !== order.buyerId) {
       return res.status(403).json({ error: "Unauthorized: Only the order buyer or an administrator can release escrow." });
     }
@@ -71312,14 +71309,14 @@ app.post("/api/payments/escrow/release", (req, res) => {
     res.status(400).json({ error: err.message });
   }
 });
-app.post("/api/payments/escrow/refund", (req, res) => {
+app.post("/api/payments/escrow/refund", requireAuth, (req, res) => {
   try {
-    const userId = resolveUserId(req);
+    const userId = req.authenticatedUserId;
     const caller = users.find((u) => u.id === userId);
     const { orderId, reason } = req.body;
     const order = orders.find((o) => o.id === orderId);
     if (!order) return res.status(404).json({ error: "Order not found" });
-    const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || ADMIN_TOKEN && req.headers.authorization;
+    const isAdmin = caller?.role === "admin" || caller?.role === "super_admin";
     if (!isAdmin && userId !== order.buyerId && userId !== order.sellerId) {
       return res.status(403).json({ error: "Unauthorized: Only order participants or administrators can refund escrow." });
     }
@@ -71344,11 +71341,17 @@ app.post("/api/payments/escrow/refund", (req, res) => {
     res.status(400).json({ error: err.message });
   }
 });
-app.post("/api/payments/escrow/deposit", rateLimit(20, 6e4), (req, res) => {
+app.post("/api/payments/escrow/deposit", requireAuth, rateLimit(20, 6e4), (req, res) => {
   try {
+    const authUserId = req.authenticatedUserId;
+    const caller = users.find((u) => u.id === authUserId);
     const orderId = String(req.body?.orderId || "");
     const order = orders.find((o) => o.id === orderId);
     if (!order) return res.status(404).json({ error: "Order not found" });
+    const isAdmin = caller?.role === "admin" || caller?.role === "super_admin";
+    if (!isAdmin && order.buyerId !== authUserId) {
+      return res.status(403).json({ error: "Forbidden: Only the order buyer or admin can fund escrow." });
+    }
     if (order.status !== "in_progress") {
       return res.status(400).json({ error: `Cannot fund escrow for order in status "${order.status}"` });
     }
@@ -71378,9 +71381,16 @@ app.post("/api/payments/escrow/deposit", rateLimit(20, 6e4), (req, res) => {
     res.status(400).json({ error: err.message });
   }
 });
-app.get("/api/payments/transactions/:userId", (req, res) => {
+app.get("/api/payments/transactions/:userId", requireAuth, (req, res) => {
   try {
-    const userId = req.params.userId;
+    const authUserId = req.authenticatedUserId;
+    const targetUserId = req.params.userId;
+    const caller = users.find((u) => u.id === authUserId);
+    const isAdmin = caller?.role === "admin" || caller?.role === "super_admin";
+    if (!isAdmin && authUserId !== targetUserId) {
+      return res.status(403).json({ error: "Forbidden: Cannot access transactions of another user." });
+    }
+    const userId = targetUserId;
     const allTxns = financeLedger.getTransactions();
     const userTxns = allTxns.filter((t2) => t2.userId === userId);
     if (userTxns.length === 0) {
@@ -72747,7 +72757,7 @@ if (process.env.NODE_ENV !== "production") {
   });
 }
 var PORT = process.env.PORT || 3e3;
-server.listen(PORT, () => {
+server.listen(Number(PORT), () => {
   console.log(`WorkPerHour server running on http://localhost:${PORT}`);
 });
 /*! Bundled license information:

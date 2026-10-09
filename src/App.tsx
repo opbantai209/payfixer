@@ -1346,9 +1346,15 @@ export default function App() {
         })
       });
       const newOrd = await res.json();
+      if (!res.ok) {
+        // e.g. insufficient wallet balance: nothing was created or charged
+        window.alert(newOrd?.error || 'Could not place the order.');
+        return;
+      }
       setOrders(prev => [newOrd, ...prev]);
       setSelectedOrder(newOrd);
       fetchMessages(newOrd.id);
+      fetchAllAdminData();
       navigate('/orders');
     } catch (err) {
       console.error(err);
@@ -2330,8 +2336,10 @@ export default function App() {
                           <input 
                             type="number" 
                             value={editUserForm.walletBalance}
-                            onChange={(e) => setEditUserForm(prev => ({ ...prev, walletBalance: Number(e.target.value) }))}
-                            className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:bg-white focus:border-emerald-500 font-mono"
+                            readOnly
+                            title="Wallet balances are controlled by the ledger. Use Finance > Adjustments."
+                            onChange={() => {}}
+                            className="w-full px-3 py-2 bg-slate-50 opacity-60 cursor-not-allowed border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:bg-white focus:border-emerald-500 font-mono"
                           />
                         </div>
                       </div>

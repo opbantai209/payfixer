@@ -98,44 +98,25 @@ function runTests() {
   }
   assert(caughtMixedCurrency, 'Mixed currency journal correctly rejected');
 
-  // Test 5: Escrow Release Lifecycle (90% to freelancer, 10% platform fee)
-  const initialFreelancerWallet = engine.getWalletById('user_3')?.wallet;
-  const initialFreelancerBalance = initialFreelancerWallet?.availableBalance || 0;
-
-  const releaseResult = engine.releaseEscrow({
-    orderId: 'ord_test_999',
-    orderTitle: 'Cloud Infrastructure Setup',
-    amount: 1000,
-    sellerId: 'user_3',
-    buyerId: 'user_2',
-    actor: 'Test Admin'
-  });
+  // Test 5: Escrow Release Lifecycle (90% to freelancer, 10% platform fee) - escrow must be funded first
+  const initialFreelancerBalance = engine.getWalletById('user_3')?.wallet.availableBalance || 0;
+  engine.fundEscrow({ orderId: 'ord_test_999', orderTitle: 'Cloud Infrastructure Setup', amount: 1000, buyerId: 'user_2', sellerId: 'user_3', actor: 'Test Admin' });
+  const releaseResult = engine.releaseEscrow({ orderId: 'ord_test_999', actor: 'Test Admin' });
 
   assert(releaseResult.freelancerNet === 900, 'Escrow release credited 90% net ($900) to freelancer');
   assert(releaseResult.platformFee === 100, 'Escrow release reserved 10% ($100) platform fee');
-
-  const updatedFreelancerWallet = engine.getWalletById('user_3')?.wallet;
   assert(
-    updatedFreelancerWallet?.availableBalance === initialFreelancerBalance + 900,
+    engine.getWalletById('user_3')?.wallet.availableBalance === initialFreelancerBalance + 900,
     'Freelancer available balance updated accurately in ledger & wallet projection'
   );
 
   // Test 6: Escrow Refund Lifecycle
-  const initialBuyerWallet = engine.getWalletById('user_2')?.wallet;
-  const initialBuyerBalance = initialBuyerWallet?.availableBalance || 0;
-
-  engine.refundEscrow({
-    orderId: 'ord_test_refund_1',
-    orderTitle: 'Cancelled Task',
-    amount: 400,
-    buyerId: 'user_2',
-    reason: 'Buyer cancellation before milestone acceptance',
-    actor: 'Support Agent'
-  });
-
-  const updatedBuyerWallet = engine.getWalletById('user_2')?.wallet;
+  const buyerBefore = engine.getWalletById('user_2')?.wallet.availableBalance || 0;
+  engine.fundEscrow({ orderId: 'ord_test_refund_1', orderTitle: 'Cancelled Task', amount: 400, buyerId: 'user_2', sellerId: 'user_3', actor: 'Support Agent' });
+  assert(engine.getWalletById('user_2')?.wallet.availableBalance === buyerBefore - 400, 'Funding escrow debits the buyer wallet');
+  engine.refundEscrow({ orderId: 'ord_test_refund_1', reason: 'Buyer cancellation before milestone acceptance', actor: 'Support Agent' });
   assert(
-    updatedBuyerWallet?.availableBalance === initialBuyerBalance + 400,
+    engine.getWalletById('user_2')?.wallet.availableBalance === buyerBefore,
     'Buyer available balance restored accurately via double-entry refund'
   );
 

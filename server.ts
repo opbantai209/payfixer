@@ -6,14 +6,69 @@ import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
-import { financeLedger } from './src/server/financeLedger.js';
+import { randomUUID, timingSafeEqual } from 'crypto';
+import type { Request, Response, NextFunction } from 'express';
+import { financeLedger, FinanceLedgerEngine } from './src/server/financeLedger.js';
+import { DEFAULT_SITE_SETTINGS } from './src/server/siteSettings.js';
 
 dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '100kb' }));
+
+// ==========================================
+// PAYMENT SECURITY LAYER
+// ==========================================
+const IS_PROD = process.env.NODE_ENV === 'production';
+const ADMIN_TOKEN = process.env.ADMIN_API_TOKEN || '';
+const REQUIRE_KYC_FOR_PAYOUTS = process.env.REQUIRE_KYC_FOR_PAYOUTS !== 'false';
+
+// Feed business rules from the site settings into the ledger engine
+financeLedger.configure({
+  commissionPercent: DEFAULT_SITE_SETTINGS.commission.commissionPercent,
+  minimumOrderAmount: DEFAULT_SITE_SETTINGS.commission.minimumOrderAmount,
+  minimumWithdrawalAmount: DEFAULT_SITE_SETTINGS.wallets.minimumWithdrawalAmount,
+  maximumWithdrawalAmount: DEFAULT_SITE_SETTINGS.wallets.maximumWithdrawalPerTransaction
+});
+
+// Admin guard. Set ADMIN_API_TOKEN in your environment; send it as "Authorization: Bearer <token>".
+// In production the admin and money-moving endpoints stay disabled until a token is configured.
+function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  if (!ADMIN_TOKEN) {
+    if (IS_PROD) return res.status(503).json({ error: 'ADMIN_API_TOKEN is not configured; admin endpoints are disabled.' });
+    return next(); // local development convenience only
+  }
+  const header = String(req.headers.authorization || '');
+  const given = header.startsWith('Bearer ') ? header.slice(7) : '';
+  const a = Buffer.from(given);
+  const b = Buffer.from(ADMIN_TOKEN);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return res.status(401).json({ error: 'Admin authorization required.' });
+  next();
+}
+// The actor name recorded in audit trails is decided by the server, never by the request body.
+const adminActor = (_req: Request) => 'Admin';
+
+// Minimal in-memory rate limiter for money-moving user endpoints.
+const rateBuckets = new Map<string, { count: number; resetAt: number }>();
+function rateLimit(max: number, windowMs: number) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const key = `${req.ip}:${req.method}:${req.baseUrl}${req.path}`;
+    const now = Date.now();
+    const b = rateBuckets.get(key);
+    if (!b || b.resetAt < now) { rateBuckets.set(key, { count: 1, resetAt: now + windowMs }); return next(); }
+    if (++b.count > max) return res.status(429).json({ error: 'Too many requests. Please slow down.' });
+    next();
+  };
+}
+
+// Everything under /api/admin and the order admin actions require the admin token.
+app.use('/api/admin', requireAdmin);
+for (const sub of ['force-complete', 'force-cancel', 'admin-notes', 'extend-time', 'mute']) {
+  app.use(`/api/orders/:id/${sub}`, requireAdmin);
+}
+app.use(['/api/payouts', '/api/refunds', '/api/audit-logs'], (req: Request, res: Response, next: NextFunction) => (req.method === 'GET' ? requireAdmin(req, res, next) : next()));
 
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
@@ -1009,6 +1064,83 @@ app.post('/api/admin/settings', (req, res) => {
   res.json({ success: true, settings: siteFeeSettings });
 });
 
+// ==========================================
+// MONEY HELPERS (all balance changes go through the ledger engine)
+// ==========================================
+function syncUserBalances() {
+  for (const u of users) {
+    const b = financeLedger.getWalletBalance(u.id);
+    if (b !== null) u.walletBalance = b;
+  }
+}
+syncUserBalances();
+
+// Every regular user gets a ledger wallet the first time they touch money.
+function ensureWallet(userId: string) {
+  const u = users.find(x => x.id === userId);
+  if (!u || u.role === 'admin' || u.role === 'super_admin') return;
+  financeLedger.ensureWallet({ userId: u.id, name: u.name, email: u.email, role: gigs.some(g => g.freelancerId === u.id) ? 'freelancer' : 'buyer' });
+}
+
+function pushSystemMessage(orderId: string, text: string) {
+  messages.push({
+    id: 'msg_' + randomUUID().slice(0, 12),
+    orderId,
+    senderId: 'system',
+    senderName: 'WorkSphere Escrow Vault',
+    text,
+    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  } as Message);
+}
+
+function closeActiveDispute(orderId: string, status: Dispute['status'], notes: string) {
+  const d = disputes.find(x => x.orderId === orderId && (x.status === 'open' || x.status === 'under_investigation'));
+  if (d) { d.status = status; d.resolutionNotes = notes; }
+}
+
+function assertOrderOpen(order: Order) {
+  if (order.status === 'completed') throw new Error('Order is already completed; funds were already released.');
+  if (order.status === 'cancelled') throw new Error('Order is already cancelled; funds were already handled.');
+}
+
+function releaseOrderFunds(order: Order, actor: string, reason: string, requestKey?: string) {
+  assertOrderOpen(order);
+  const result = financeLedger.releaseEscrow({ orderId: order.id, actor, reason, requestKey });
+  order.status = 'completed';
+  const seller = users.find(u => u.id === order.sellerId);
+  if (seller) {
+    seller.earned = (seller.earned || 0) + result.freelancerNet;
+    seller.completedJobs = (seller.completedJobs || 0) + 1;
+  }
+  syncUserBalances();
+  return result;
+}
+
+function refundOrderFunds(order: Order, amount: number | undefined, actor: string, reason: string, requestKey?: string) {
+  assertOrderOpen(order);
+  const result = financeLedger.refundEscrow({ orderId: order.id, amount, reason, actor, requestKey });
+  if (result.remaining === 0) order.status = 'cancelled';
+  const record = refunds.find(r => r.orderId === order.id && r.status === 'pending');
+  if (record) { record.status = 'approved'; record.amount = result.refunded; }
+  else refunds.push({ id: 'ref_' + randomUUID().slice(0, 12), orderId: order.id, buyerId: order.buyerId, amount: result.refunded, reason, status: 'approved', createdAt: new Date().toISOString().substring(0, 10) });
+  syncUserBalances();
+  return result;
+}
+
+function splitOrderFunds(order: Order, refundAmount: number, actor: string, reason: string) {
+  assertOrderOpen(order);
+  const result = financeLedger.resolveEscrowSplit({ orderId: order.id, refundAmount, reason, actor });
+  order.status = 'completed';
+  const seller = users.find(u => u.id === order.sellerId);
+  if (seller) {
+    seller.earned = (seller.earned || 0) + result.release.freelancerNet;
+    seller.completedJobs = (seller.completedJobs || 0) + 1;
+  }
+  refunds.push({ id: 'ref_' + randomUUID().slice(0, 12), orderId: order.id, buyerId: order.buyerId, amount: refundAmount, reason, status: 'approved', createdAt: new Date().toISOString().substring(0, 10) });
+  syncUserBalances();
+  return result;
+}
+
 app.get('/api/users', (req, res) => res.json(users));
 app.get('/api/gigs', (req, res) => res.json(gigs));
 app.get('/api/projects', (req, res) => res.json(projects));
@@ -1194,88 +1326,45 @@ app.post('/api/users/:id/flag', (req, res) => {
   res.json({ success: true, isFlagged: user.isFlagged, flagReason: user.flagReason, user });
 });
 
-// Force Complete & Release Funds
+// Force Complete & Release Funds (admin)
 app.post('/api/orders/:id/force-complete', (req, res) => {
-  const order = orders.find(o => o.id === req.params.id);
-  if (!order) return res.status(404).json({ error: 'Order not found' });
-
-  // Resolve any active dispute
-  const dispute = disputes.find(d => d.orderId === order.id && (d.status === 'open' || d.status === 'under_investigation'));
-  if (dispute) {
-    dispute.status = 'resolved_release';
-    dispute.resolutionNotes = req.body.reason || 'Admin administrative force-release in seller favor.';
+  try {
+    const order = orders.find(o => o.id === req.params.id);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    const reason = String(req.body.reason || 'Admin administrative force-release in seller favor.');
+    const result = releaseOrderFunds(order, adminActor(req), reason, req.body.requestKey);
+    closeActiveDispute(order.id, 'resolved_release', reason);
+    pushSystemMessage(order.id, `✅ Order Approved & Completed by Administration! Escrow funds released to freelancer wallet. Net Payout: $${result.freelancerNet}.`);
+    res.json({ success: true, order: enrichOrderWithServiceInfo(order), result });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
   }
-
-  const result = financeLedger.releaseEscrow({
-    orderId: order.id,
-    orderTitle: order.title,
-    amount: order.amount,
-    sellerId: order.sellerId,
-    buyerId: order.buyerId,
-    actor: req.body.actor || 'Super Admin'
-  });
-
-  order.status = 'completed';
-
-  const seller = users.find(u => u.id === order.sellerId);
-  if (seller) {
-    seller.walletBalance = (seller.walletBalance || 0) + result.freelancerNet;
-  }
-
-  const sysMsg: Message = {
-    id: 'msg_' + Date.now(),
-    orderId: order.id,
-    senderId: 'system',
-    senderName: 'WorkSphere Escrow Vault',
-    text: `✅ Order Approved & Completed by Administration! Escrow funds released to freelancer wallet. Net Payout: $${result.freelancerNet}.`,
-    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-  };
-  messages.push(sysMsg);
-
-  res.json({ success: true, order: enrichOrderWithServiceInfo(order), result });
 });
 
-// Force Cancel & Refund Buyer
+// Force Cancel & Refund Buyer (admin). A partial refund refunds that amount and releases the rest to the seller.
 app.post('/api/orders/:id/force-cancel', (req, res) => {
-  const order = orders.find(o => o.id === req.params.id);
-  if (!order) return res.status(404).json({ error: 'Order not found' });
-
-  const isPartial = req.body.refundType === 'partial';
-  const refundAmount = isPartial && Number(req.body.customAmount) > 0 ? Number(req.body.customAmount) : order.amount;
-
-  const dispute = disputes.find(d => d.orderId === order.id && (d.status === 'open' || d.status === 'under_investigation'));
-  if (dispute) {
-    dispute.status = isPartial ? 'resolved_partial' : 'resolved_refund';
-    dispute.resolutionNotes = req.body.reason || 'Admin administrative cancellation and refund.';
+  try {
+    const order = orders.find(o => o.id === req.params.id);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    const reason = String(req.body.reason || 'Admin cancelled order and refunded buyer wallet');
+    const isPartial = req.body.refundType === 'partial';
+    let result: any;
+    let refundAmount: number;
+    if (isPartial) {
+      refundAmount = Number(req.body.customAmount);
+      result = splitOrderFunds(order, refundAmount, adminActor(req), reason);
+      closeActiveDispute(order.id, 'resolved_partial', reason);
+      pushSystemMessage(order.id, `⚖️ Order resolved by Administration. $${refundAmount} refunded to buyer; the remainder was released to the freelancer. Reason: ${reason}`);
+    } else {
+      result = refundOrderFunds(order, undefined, adminActor(req), reason, req.body.requestKey);
+      refundAmount = result.refunded;
+      closeActiveDispute(order.id, 'resolved_refund', reason);
+      pushSystemMessage(order.id, `🚨 Order Cancelled & Refunded by Administration. $${refundAmount} credited back to buyer wallet balance. Reason: ${reason}`);
+    }
+    res.json({ success: true, order: enrichOrderWithServiceInfo(order), result });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
   }
-
-  const result = financeLedger.refundEscrow({
-    orderId: order.id,
-    orderTitle: order.title,
-    amount: refundAmount,
-    buyerId: order.buyerId,
-    reason: req.body.reason || 'Admin cancelled order and refunded buyer wallet',
-    actor: req.body.actor || 'Super Admin'
-  });
-
-  order.status = 'cancelled';
-
-  const buyer = users.find(u => u.id === order.buyerId);
-  if (buyer) {
-    buyer.walletBalance = (buyer.walletBalance || 0) + refundAmount;
-  }
-
-  const sysMsg: Message = {
-    id: 'msg_' + Date.now(),
-    orderId: order.id,
-    senderId: 'system',
-    senderName: 'WorkSphere Escrow Vault',
-    text: `🚨 Order Cancelled & Refunded by Administration. $${refundAmount} credited back to buyer wallet balance. Reason: ${req.body.reason || 'Administrative cancellation.'}`,
-    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-  };
-  messages.push(sysMsg);
-
-  res.json({ success: true, order: enrichOrderWithServiceInfo(order), result });
 });
 
 // Send Chat Message into Order Workstream
@@ -1429,13 +1518,7 @@ app.get('/api/payments/user/:userId', (req, res) => {
     const u = users.find(user => user.id === userId);
     
     if (u) {
-      financeLedger.ensureWalletExists({
-        id: u.id,
-        name: u.name,
-        email: u.email,
-        role: u.role,
-        initialBalance: u.walletBalance
-      });
+      ensureWallet(u.id);
     }
 
     const walletData = financeLedger.getWalletById(userId);
@@ -1490,26 +1573,19 @@ app.post('/api/payments/deposit', (req, res) => {
     const u = users.find(user => user.id === userId);
     if (!u) return res.status(404).json({ error: 'User not found' });
 
-    financeLedger.ensureWalletExists({
-      id: u.id,
-      name: u.name,
-      email: u.email,
-      role: u.role,
-      initialBalance: u.walletBalance
-    });
-
-    const result = financeLedger.depositFunds({
+    ensureWallet(u.id);
+    const key = String(providerReference || randomUUID());
+    const result = financeLedger.creditDeposit({
       userId: u.id,
-      userName: u.name,
-      userEmail: u.email,
-      userRole: u.role,
       amount: numAmount,
-      paymentMethod: paymentMethod || 'Instant Card Settlement',
-      providerReference: providerReference || `PAY-${Date.now()}`,
-      actor: u.name
+      reference: providerReference || `PAY-${Date.now()}`,
+      idempotencyKey: `DEP-${u.id}-${key}`,
+      actor: u.name,
+      source: paymentMethod || 'Instant Card Settlement'
     });
-
-    u.walletBalance = result.newBalance;
+    syncUserBalances();
+    const newBalance = financeLedger.getWalletBalance(u.id) ?? u.walletBalance;
+    const transaction = financeLedger.getTransactions().find(t => t.journalId === result.journal.id);
 
     auditLogs.unshift({
       id: 'log_' + Date.now(),
@@ -1517,11 +1593,11 @@ app.post('/api/payments/deposit', (req, res) => {
       role: u.role,
       action: 'FUNDS_DEPOSITED',
       target: `User ${u.name}`,
-      details: `Deposited $${numAmount.toFixed(2)} via ${paymentMethod || 'Credit Card'}. New Balance: $${result.newBalance.toFixed(2)}`,
+      details: `Deposited $${numAmount.toFixed(2)} via ${paymentMethod || 'Credit Card'}. New Balance: $${newBalance.toFixed(2)}`,
       timestamp: new Date().toLocaleString()
     });
 
-    res.json({ success: true, newBalance: result.newBalance, transaction: result.transaction });
+    res.json({ success: true, newBalance, transaction });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
@@ -1543,26 +1619,21 @@ app.post('/api/payments/withdraw', (req, res) => {
       return res.status(400).json({ error: `Insufficient available funds. Available: $${u.walletBalance.toFixed(2)}, Requested: $${numAmount.toFixed(2)}` });
     }
 
-    financeLedger.ensureWalletExists({
-      id: u.id,
-      name: u.name,
-      email: u.email,
-      role: u.role,
-      initialBalance: u.walletBalance
-    });
-
-    const result = financeLedger.requestPayout({
-      userId: u.id,
+    ensureWallet(u.id);
+    const payoutId = 'pay_' + randomUUID().slice(0, 8);
+    financeLedger.requestPayout({
+      payoutId,
+      freelancerId: u.id,
       amount: numAmount,
       method: method || 'Bank Transfer',
       accountDetails: accountDetails || 'Primary Bank Account',
       actor: u.name
     });
-
-    u.walletBalance = result.newBalance;
+    syncUserBalances();
+    const newBalance = financeLedger.getWalletBalance(u.id) ?? u.walletBalance;
 
     const newPayout: Payout = {
-      id: 'pay_' + Date.now(),
+      id: payoutId,
       freelancerId: u.id,
       amount: numAmount,
       method: (method as any) || 'Bank Transfer',
@@ -1571,6 +1642,7 @@ app.post('/api/payments/withdraw', (req, res) => {
       accountDetails: accountDetails || 'Primary Bank Wire'
     };
     payouts.unshift(newPayout);
+    const transaction = financeLedger.getTransactions().find(t => t.relatedPayoutId === payoutId);
 
     auditLogs.unshift({
       id: 'log_' + Date.now(),
@@ -1582,7 +1654,7 @@ app.post('/api/payments/withdraw', (req, res) => {
       timestamp: new Date().toLocaleString()
     });
 
-    res.json({ success: true, newBalance: result.newBalance, payout: newPayout, transaction: result.transaction });
+    res.json({ success: true, newBalance, payout: newPayout, transaction });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
@@ -1602,29 +1674,10 @@ app.post('/api/payments/escrow/release', (req, res) => {
     const seller = users.find(u => u.id === order.sellerId);
     const buyer = users.find(u => u.id === order.buyerId);
 
-    if (seller) {
-      financeLedger.ensureWalletExists({ id: seller.id, name: seller.name, email: seller.email, role: 'freelancer', initialBalance: seller.walletBalance });
-    }
-    if (buyer) {
-      financeLedger.ensureWalletExists({ id: buyer.id, name: buyer.name, email: buyer.email, role: 'buyer', initialBalance: buyer.walletBalance });
-    }
+    if (seller) ensureWallet(seller.id);
+    if (buyer) ensureWallet(buyer.id);
 
-    const result = financeLedger.releaseEscrow({
-      orderId: order.id,
-      orderTitle: order.title,
-      amount: order.amount,
-      sellerId: order.sellerId,
-      buyerId: order.buyerId,
-      actor: (buyer?.name || 'Authorized Buyer')
-    });
-
-    order.status = 'completed';
-
-    if (seller) {
-      seller.walletBalance += result.freelancerNet;
-      seller.earned = (seller.earned || 0) + result.freelancerNet;
-      seller.completedJobs = (seller.completedJobs || 0) + 1;
-    }
+    const result = releaseOrderFunds(order, buyer?.name || 'Authorized Buyer', 'Buyer approved work');
 
     auditLogs.unshift({
       id: 'log_' + Date.now(),
@@ -1654,46 +1707,21 @@ app.post('/api/payments/escrow/refund', (req, res) => {
     }
 
     const buyer = users.find(u => u.id === order.buyerId);
-    if (buyer) {
-      financeLedger.ensureWalletExists({ id: buyer.id, name: buyer.name, email: buyer.email, role: 'buyer', initialBalance: buyer.walletBalance });
-    }
+    if (buyer) ensureWallet(buyer.id);
 
-    financeLedger.refundEscrow({
-      orderId: order.id,
-      orderTitle: order.title,
-      amount: order.amount,
-      buyerId: order.buyerId,
-      reason: reason || 'Buyer escrow refund agreement',
-      actor: buyer?.name || 'Buyer'
-    });
-
-    order.status = 'cancelled';
-
-    if (buyer) {
-      buyer.walletBalance += order.amount;
-    }
-
-    refunds.unshift({
-      id: 'ref_' + Date.now(),
-      orderId: order.id,
-      buyerId: order.buyerId,
-      amount: order.amount,
-      reason: reason || 'Escrow cancellation & refund to wallet',
-      status: 'approved',
-      createdAt: new Date().toISOString().substring(0, 10)
-    });
+    const result = refundOrderFunds(order, undefined, buyer?.name || 'Buyer', reason || 'Buyer escrow refund agreement');
 
     auditLogs.unshift({
       id: 'log_' + Date.now(),
       actor: buyer?.name || 'Buyer',
       role: 'buyer',
-      action: 'ESCROW_REFUNDED_TO_BUYER',
+      action: 'ESCROW_REFUNDED_BY_BUYER',
       target: `Order #${order.id}`,
-      details: `Refunded $${order.amount} from escrow back to buyer wallet. Reason: ${reason || 'Mutual cancellation'}`,
+      details: `Buyer requested escrow refund of $${result.refunded} to wallet. Reason: ${reason || 'Escrow cancellation'}`,
       timestamp: new Date().toLocaleString()
     });
 
-    res.json({ success: true, order, newBalance: buyer?.walletBalance });
+    res.json({ success: true, order, refunded: result.refunded });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
@@ -1936,7 +1964,7 @@ app.post('/api/admin/finance/wallets/:id/freeze', (req, res) => {
   try {
     const { reason } = req.body;
     if (!reason) return res.status(400).json({ error: 'Mandatory reason required to freeze a wallet' });
-    const wallet = financeLedger.freezeWallet(req.params.id, reason, req.body.actor || 'Super Admin');
+    const wallet = financeLedger.freezeWallet(req.params.id, reason, adminActor(req));
     res.json(wallet);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -1946,7 +1974,7 @@ app.post('/api/admin/finance/wallets/:id/freeze', (req, res) => {
 app.post('/api/admin/finance/wallets/:id/unfreeze', (req, res) => {
   try {
     const { reason } = req.body;
-    const wallet = financeLedger.unfreezeWallet(req.params.id, reason || 'Administrative review completed', req.body.actor || 'Super Admin');
+    const wallet = financeLedger.unfreezeWallet(req.params.id, reason || 'Administrative review completed', adminActor(req));
     res.json(wallet);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -1957,7 +1985,7 @@ app.post('/api/admin/finance/wallets/:id/restrict', (req, res) => {
   try {
     const { reason } = req.body;
     if (!reason) return res.status(400).json({ error: 'Mandatory reason required to restrict a wallet' });
-    const wallet = financeLedger.restrictWallet(req.params.id, reason, req.body.actor || 'Super Admin');
+    const wallet = financeLedger.restrictWallet(req.params.id, reason, adminActor(req));
     res.json(wallet);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -2009,7 +2037,7 @@ app.post('/api/admin/finance/ledger/:id/reverse', (req, res) => {
   try {
     const { reason, actor } = req.body;
     if (!reason) return res.status(400).json({ error: 'Mandatory accounting reversal reason required' });
-    const reversal = financeLedger.reverseJournal(req.params.id, reason, actor || 'Chief Finance Officer');
+    const reversal = financeLedger.reverseJournal(req.params.id, reason, adminActor(req));
     res.json(reversal);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -2039,9 +2067,11 @@ app.get('/api/admin/finance/escrow', (req, res) => {
         buyerEmail: buyer?.email || '',
         sellerName: seller?.name || 'Freelancer #' + o.sellerId,
         sellerEmail: seller?.email || '',
-        platformFeeRate: '10%',
-        platformFeeAmount: Math.round(o.amount * 0.10),
-        freelancerNetAmount: Math.round(o.amount * 0.90),
+        platformFeeRate: `${financeLedger.getPlatformCommissionRate()}%`,
+        platformFeeAmount: FinanceLedgerEngine.round(o.amount * financeLedger.getPlatformCommissionRate() / 100),
+        freelancerNetAmount: FinanceLedgerEngine.round(o.amount - o.amount * financeLedger.getPlatformCommissionRate() / 100),
+        ledgerEscrowStatus: financeLedger.getEscrow(o.id)?.status || 'not_funded',
+        ledgerEscrowHeld: financeLedger.getEscrow(o.id)?.remaining ?? 0,
         escrowState,
         isDisputed
       };
@@ -2056,32 +2086,11 @@ app.post('/api/admin/finance/escrow/:orderId/release', (req, res) => {
   try {
     const order = orders.find(o => o.id === req.params.orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
-
-    // Ensure not actively disputed
     const activeDispute = disputes.find(d => d.orderId === order.id && (d.status === 'open' || d.status === 'under_investigation'));
     if (activeDispute) {
       return res.status(400).json({ error: `Cannot release escrow: Order #${order.id} is under active dispute (${activeDispute.id}). Resolve the dispute first.` });
     }
-
-    const result = financeLedger.releaseEscrow({
-      orderId: order.id,
-      orderTitle: order.title,
-      amount: order.amount,
-      sellerId: order.sellerId,
-      buyerId: order.buyerId,
-      actor: req.body.actor || 'Super Admin'
-    });
-
-    order.status = 'completed';
-
-    // Synchronize seller user walletBalance
-    const seller = users.find(u => u.id === order.sellerId);
-    if (seller) {
-      seller.walletBalance += result.freelancerNet;
-      seller.earned = (seller.earned || 0) + result.freelancerNet;
-      seller.completedJobs = (seller.completedJobs || 0) + 1;
-    }
-
+    const result = releaseOrderFunds(order, adminActor(req), String(req.body.reason || 'Administrative escrow release'), req.body.requestKey);
     res.json({ success: true, order, journal: result.journal, freelancerNet: result.freelancerNet, platformFee: result.platformFee });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -2090,41 +2099,11 @@ app.post('/api/admin/finance/escrow/:orderId/release', (req, res) => {
 
 app.post('/api/admin/finance/escrow/:orderId/refund', (req, res) => {
   try {
-    const { reason, actor } = req.body;
     const order = orders.find(o => o.id === req.params.orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
-
-    const result = financeLedger.refundEscrow({
-      orderId: order.id,
-      orderTitle: order.title,
-      amount: order.amount,
-      buyerId: order.buyerId,
-      reason: reason || 'Administrative escrow refund approval',
-      actor: actor || 'Super Admin'
-    });
-
-    // Mark refund in refunds list
-    const existingRefund = refunds.find(r => r.orderId === order.id);
-    if (existingRefund) {
-      existingRefund.status = 'approved';
-    } else {
-      refunds.push({
-        id: 'ref_' + Date.now(),
-        orderId: order.id,
-        buyerId: order.buyerId,
-        amount: order.amount,
-        reason: reason || 'Administrative escrow refund',
-        status: 'approved',
-        createdAt: new Date().toISOString().substring(0, 10)
-      });
-    }
-
-    // Synchronize buyer user walletBalance
-    const buyer = users.find(u => u.id === order.buyerId);
-    if (buyer) {
-      buyer.walletBalance += order.amount;
-    }
-
+    const amount = req.body.amount === undefined || req.body.amount === '' ? undefined : Number(req.body.amount);
+    const result = refundOrderFunds(order, amount, adminActor(req), String(req.body.reason || 'Administrative escrow refund approval'), req.body.requestKey);
+    closeActiveDispute(order.id, 'resolved_refund', String(req.body.reason || 'Administrative escrow refund'));
     res.json({ success: true, order, journal: result.journal });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -2151,127 +2130,138 @@ app.get('/api/admin/finance/payouts', (req, res) => {
   }
 });
 
-app.post('/api/admin/finance/payouts/:id/approve', (req, res) => {
+const REVIEW_THRESHOLD = DEFAULT_SITE_SETTINGS.wallets.manualReviewThresholdAmount;
+const ALLOWED_METHODS: Record<string, keyof typeof DEFAULT_SITE_SETTINGS.wallets.allowedPayoutMethods> = {
+  'UPI': 'upi', 'Bank Transfer': 'bankTransfer', 'Stripe': 'stripeConnect', 'Razorpay': 'razorpayX', 'PayPal': 'paypal'
+};
+
+function payoutAudit(req: Request, action: string, p: Payout, details: string) {
+  auditLogs.unshift({
+    id: 'FAUD-' + randomUUID().slice(0, 12),
+    actor: adminActor(req),
+    role: 'super_admin',
+    action,
+    target: `Payout #${p.id}`,
+    details,
+    timestamp: new Date().toLocaleString()
+  });
+}
+
+const approvePayout = (req: Request, res: Response) => {
   try {
     const p = payouts.find(pay => pay.id === req.params.id);
     if (!p) return res.status(404).json({ error: 'Payout not found' });
     if (p.status !== 'pending') return res.status(400).json({ error: `Cannot approve payout in status "${p.status}"` });
-
     p.status = 'approved';
-
-    auditLogs.unshift({
-      id: 'FAUD-' + Date.now(),
-      actor: req.body.actor || 'Chief Finance Officer',
-      role: 'super_admin',
-      action: 'PAYOUT_APPROVED',
-      target: `Payout #${p.id}`,
-      details: `Approved payout of $${p.amount} via ${p.method} for freelancer ${p.freelancerId}`,
-      timestamp: new Date().toLocaleString()
-    });
-
+    payoutAudit(req, 'PAYOUT_APPROVED', p, `Approved payout of $${p.amount} via ${p.method} for freelancer ${p.freelancerId}`);
     res.json(p);
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
-  }
-});
+  } catch (err: any) { res.status(400).json({ error: err.message }); }
+};
 
-app.post('/api/admin/finance/payouts/:id/process', (req, res) => {
+// Marks a payout as paid. When a real gateway is connected, call it here FIRST and only continue on success.
+const processPayout = (req: Request, res: Response) => {
   try {
     const p = payouts.find(pay => pay.id === req.params.id);
     if (!p) return res.status(404).json({ error: 'Payout not found' });
-    if (p.status !== 'pending' && p.status !== 'approved') {
-      return res.status(400).json({ error: `Cannot process payout in status "${p.status}"` });
-    }
-
-    const freelancer = users.find(u => u.id === p.freelancerId);
-
-    // Post Double-Entry Journal for Payout Settlement:
-    // Debit 2020 Freelancer Wallets Payable $X -> Credit 1030 Payout Gateway Transit $X
-    const journal = financeLedger.postJournal({
-      reference: `PAY-${p.id}-DISBURSED`,
-      description: `Disbursed Payout #${p.id} via ${p.method} to ${freelancer?.name || p.freelancerId} (${p.accountDetails})`,
-      eventType: 'PAYOUT_SETTLED',
-      idempotencyKey: `IDEMP-PAY-PROCESS-${p.id}`,
-      actor: req.body.actor || 'Super Admin',
-      entries: [
-        {
-          accountCode: '2020',
-          accountName: 'Freelancer Wallets Payable',
-          debit: p.amount,
-          credit: 0,
-          currency: 'USD',
-          description: `Withdrawn payout for ${freelancer?.name || p.freelancerId}`,
-          userId: p.freelancerId,
-          payoutId: p.id
-        },
-        {
-          accountCode: '1030',
-          accountName: 'Payout Gateway Transit',
-          debit: 0,
-          credit: p.amount,
-          currency: 'USD',
-          description: `Disbursed through ${p.method} gateway`,
-          payoutId: p.id
-        }
-      ]
-    });
-
+    if (p.status !== 'pending' && p.status !== 'approved') return res.status(400).json({ error: `Cannot process payout in status "${p.status}"` });
+    if (p.amount >= REVIEW_THRESHOLD && p.status !== 'approved') return res.status(400).json({ error: `Payouts of $${REVIEW_THRESHOLD} or more must be approved before processing.` });
+    const { journal } = financeLedger.settlePayout({ payoutId: p.id, actor: adminActor(req), providerReference: req.body?.providerReference });
     p.status = 'processed';
+    payoutAudit(req, 'PAYOUT_PROCESSED', p, `Processed payout of $${p.amount} via ${p.method}`);
+    syncUserBalances();
+    res.json({ success: true, payout: p, journal, ...p });
+  } catch (err: any) { res.status(400).json({ error: err.message }); }
+};
 
-    // Synchronize user wallet balance
-    if (freelancer && freelancer.walletBalance >= p.amount) {
-      freelancer.walletBalance = Math.max(0, freelancer.walletBalance - p.amount);
-    }
-
-    res.json({ success: true, payout: p, journal });
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.post('/api/admin/finance/payouts/:id/reject', (req, res) => {
+const rejectPayout = (req: Request, res: Response) => {
   try {
-    const { reason, actor } = req.body;
     const p = payouts.find(pay => pay.id === req.params.id);
     if (!p) return res.status(404).json({ error: 'Payout not found' });
-    if (p.status === 'processed') return res.status(400).json({ error: 'Cannot reject an already settled and processed payout.' });
-
-    financeLedger.cancelPayout({
-      payoutId: p.id,
-      freelancerId: p.freelancerId,
-      amount: p.amount,
-      reason: reason || 'Administrative rejection',
-      actor: actor || 'Chief Finance Officer'
-    });
-
+    if (p.status !== 'pending' && p.status !== 'approved') return res.status(400).json({ error: `Cannot reject payout in status "${p.status}"` });
+    financeLedger.cancelPayout({ payoutId: p.id, reason: String(req.body?.reason || 'Administrative rejection'), actor: adminActor(req) });
     p.status = 'cancelled';
-    res.json({ success: true, payout: p });
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
-  }
-});
+    payoutAudit(req, 'PAYOUT_REJECTED', p, `Rejected payout of $${p.amount}; funds returned to wallet`);
+    syncUserBalances();
+    res.json({ success: true, payout: p, ...p });
+  } catch (err: any) { res.status(400).json({ error: err.message }); }
+};
 
-app.post('/api/admin/finance/payouts/:id/retry', (req, res) => {
+const failPayout = (req: Request, res: Response) => {
+  try {
+    const p = payouts.find(pay => pay.id === req.params.id);
+    if (!p) return res.status(404).json({ error: 'Payout not found' });
+    if (p.status !== 'pending' && p.status !== 'approved') return res.status(400).json({ error: `Cannot fail payout in status "${p.status}"` });
+    financeLedger.failPayout({ payoutId: p.id, reason: String(req.body?.reason || 'Gateway reported a transfer failure'), actor: adminActor(req) });
+    p.status = 'failed';
+    payoutAudit(req, 'PAYOUT_FAILED', p, `Payout of $${p.amount} failed; funds returned to wallet`);
+    syncUserBalances();
+    res.json(p);
+  } catch (err: any) { res.status(400).json({ error: err.message }); }
+};
+
+const retryPayout = (req: Request, res: Response) => {
   try {
     const p = payouts.find(pay => pay.id === req.params.id);
     if (!p) return res.status(404).json({ error: 'Payout not found' });
     if (p.status !== 'failed') return res.status(400).json({ error: 'Only failed payouts can be retried.' });
-
+    financeLedger.retryPayout({ payoutId: p.id, actor: adminActor(req) });
     p.status = 'pending';
-    auditLogs.unshift({
-      id: 'FAUD-' + Date.now(),
-      actor: req.body.actor || 'Super Admin',
-      role: 'super_admin',
-      action: 'PAYOUT_RETRIED',
-      target: `Payout #${p.id}`,
-      details: `Re-queued failed payout of $${p.amount} for retry`,
-      timestamp: new Date().toLocaleString()
-    });
-
+    payoutAudit(req, 'PAYOUT_RETRIED', p, `Re-queued failed payout of $${p.amount}`);
+    syncUserBalances();
     res.json(p);
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
-  }
+  } catch (err: any) { res.status(400).json({ error: err.message }); }
+};
+
+app.post('/api/admin/finance/payouts/:id/approve', approvePayout);
+app.post('/api/admin/finance/payouts/:id/process', processPayout);
+app.post('/api/admin/finance/payouts/:id/reject', rejectPayout);
+app.post('/api/admin/finance/payouts/:id/fail', failPayout);
+app.post('/api/admin/finance/payouts/:id/retry', retryPayout);
+// Legacy routes still used by the older admin payments tab in App.tsx
+app.patch('/api/admin/payouts/:id/approve', approvePayout);
+app.patch('/api/admin/payouts/:id/process', processPayout);
+app.patch('/api/admin/payouts/:id/fail', failPayout);
+
+// Freelancer withdrawal request: the money leaves the wallet immediately and waits for admin approval.
+// NOTE: there is no login system yet, so freelancerId comes from the client. Bind it to the
+// authenticated session user before going live.
+app.post('/api/payouts', rateLimit(10, 60_000), (req, res) => {
+  try {
+    const freelancerId = String(req.body?.freelancerId || '');
+    const user = users.find(u => u.id === freelancerId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (user.status !== 'active') return res.status(403).json({ error: `Account is ${user.status}; withdrawals are blocked.` });
+    ensureWallet(freelancerId);
+    if (REQUIRE_KYC_FOR_PAYOUTS && !user.verified) return res.status(403).json({ error: 'Identity verification (KYC) is required before withdrawing.' });
+    const method = String(req.body?.method || '');
+    const settingKey = ALLOWED_METHODS[method];
+    if (!settingKey || !DEFAULT_SITE_SETTINGS.wallets.allowedPayoutMethods[settingKey]) return res.status(400).json({ error: 'Unsupported payout method.' });
+    const id = 'pay_' + randomUUID().slice(0, 8);
+    const { payout } = financeLedger.requestPayout({ payoutId: id, freelancerId, amount: Number(req.body?.amount), method, accountDetails: String(req.body?.accountDetails || ''), actor: `user:${freelancerId}` });
+    const record: Payout = { id, freelancerId, amount: payout.amount, method: method as Payout['method'], status: 'pending', createdAt: new Date().toISOString().substring(0, 10), accountDetails: payout.accountDetails };
+    payouts.unshift(record);
+    syncUserBalances();
+    res.status(201).json(record);
+  } catch (err: any) { res.status(400).json({ error: err.message }); }
+});
+
+// Wallet top-up. Simulated until a payment gateway is connected: when you add Stripe/Razorpay, delete this
+// route and call financeLedger.creditDeposit() from the verified webhook handler using the gateway's event id as idempotencyKey.
+app.post('/api/wallet/deposit', rateLimit(10, 60_000), (req, res) => {
+  try {
+    if (IS_PROD && process.env.ALLOW_SIMULATED_DEPOSITS !== 'true') {
+      return res.status(501).json({ error: 'Deposits require a connected payment gateway.' });
+    }
+    const userId = String(req.body?.userId || '');
+    const amount = Number(req.body?.amount);
+    if (!users.some(u => u.id === userId)) return res.status(404).json({ error: 'User not found' });
+    ensureWallet(userId);
+    if (Number.isFinite(amount) && amount > 5000) return res.status(400).json({ error: 'Simulated deposits are limited to $5,000.' });
+    const key = String(req.body?.idempotencyKey || randomUUID());
+    const { replayed } = financeLedger.creditDeposit({ userId, amount, reference: `SIM-${key}`, idempotencyKey: `SIM-${userId}-${key}`, actor: 'Simulated Gateway', source: 'simulated' });
+    syncUserBalances();
+    res.json({ success: true, replayed, balance: financeLedger.getWalletBalance(userId) });
+  } catch (err: any) { res.status(400).json({ error: err.message }); }
 });
 
 // 7. Reconciliation Workspace & Exception Resolution
@@ -2288,7 +2278,7 @@ app.post('/api/admin/finance/reconciliation/resolve/:id', (req, res) => {
   try {
     const { notes, actor } = req.body;
     if (!notes) return res.status(400).json({ error: 'Investigation notes required to mark exception resolved' });
-    const resolved = financeLedger.resolveException(req.params.id, notes, actor || 'Chief Auditor');
+    const resolved = financeLedger.resolveException(req.params.id, notes, adminActor(req));
     res.json(resolved);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -2318,7 +2308,7 @@ app.post('/api/admin/finance/adjustments/preview', (req, res) => {
 
 app.post('/api/admin/finance/adjustments', (req, res) => {
   try {
-    const { userId, amount, direction, category, reason, evidenceReference, actor } = req.body;
+    const { userId, amount, direction, category, reason, evidenceReference, requestKey } = req.body;
     const result = financeLedger.executeAdministrativeAdjustment({
       userId,
       amount: Number(amount),
@@ -2326,15 +2316,10 @@ app.post('/api/admin/finance/adjustments', (req, res) => {
       category,
       reason,
       evidenceReference,
-      actor: actor || 'Super Admin'
+      actor: adminActor(req),
+      requestKey
     });
-
-    // Synchronize users array
-    const user = users.find(u => u.id === userId);
-    if (user) {
-      user.walletBalance = result.wallet.availableBalance;
-    }
-
+    syncUserBalances();
     res.json(result);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -2865,24 +2850,47 @@ app.post('/api/proposals', (req, res) => {
   res.json(newProp);
 });
 
-app.post('/api/orders', (req, res) => {
-  const newOrd: Order = {
-    id: 'ord_' + Date.now(),
-    title: req.body.title,
-    buyerId: req.body.buyerId || 'user_2',
-    sellerId: req.body.sellerId || 'user_1',
-    amount: Number(req.body.amount),
-    status: 'funded_in_escrow',
-    createdAt: new Date().toISOString().split('T')[0],
-    dueDate: req.body.dueDate || new Date(Date.now() + 10 * 86400000).toISOString().split('T')[0],
-    escrowProtectionStartDate: new Date().toISOString().split('T')[0],
-    escrowProtectionEndDate: new Date(Date.now() + 14 * 86400000).toISOString().split('T')[0],
-    gigId: req.body.gigId,
-    projectId: req.body.projectId
-  };
-  const enriched = enrichOrderWithServiceInfo(newOrd);
-  orders.unshift(enriched);
-  res.json(enriched);
+app.post('/api/orders', rateLimit(30, 60_000), (req, res) => {
+  try {
+    // NOTE: no login system yet, so buyerId comes from the client. Bind it to the authenticated user before going live.
+    const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+    if (title.length < 3) return res.status(400).json({ error: 'A valid order title is required.' });
+    const buyerId = String(req.body?.buyerId || '');
+    const sellerId = String(req.body?.sellerId || '');
+    const buyer = users.find(u => u.id === buyerId);
+    const seller = users.find(u => u.id === sellerId);
+    if (!buyer || !seller) return res.status(404).json({ error: 'Buyer or seller not found.' });
+    if (buyerId === sellerId) return res.status(400).json({ error: 'You cannot order from yourself.' });
+    ensureWallet(buyerId); ensureWallet(sellerId);
+    if (buyer.status !== 'active' || seller.status !== 'active') return res.status(403).json({ error: 'Both accounts must be active to place an order.' });
+
+    const id = 'ord_' + randomUUID().slice(0, 12);
+    const today = new Date().toISOString().split('T')[0];
+    const rawAmount = Number(req.body?.amount);
+    const isInquiry = rawAmount === 0 && /^inquiry:/i.test(title);
+
+    let newOrd: Order;
+    if (isInquiry) {
+      // Chat thread only: nothing is charged and no escrow exists
+      newOrd = { id, title, buyerId, sellerId, amount: 0, status: 'in_progress', createdAt: today, dueDate: req.body.dueDate || new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0], gigId: req.body.gigId, projectId: req.body.projectId };
+    } else {
+      // Debits the buyer wallet into escrow. Throws (and creates nothing) if the balance is too low.
+      financeLedger.fundEscrow({ orderId: id, orderTitle: title, amount: rawAmount, buyerId, sellerId, actor: `user:${buyerId}` });
+      newOrd = {
+        id, title, buyerId, sellerId, amount: rawAmount, status: 'funded_in_escrow', createdAt: today,
+        dueDate: req.body.dueDate || new Date(Date.now() + 10 * 86400000).toISOString().split('T')[0],
+        escrowProtectionStartDate: today,
+        escrowProtectionEndDate: new Date(Date.now() + DEFAULT_SITE_SETTINGS.commission.escrowProtectionDays * 86400000).toISOString().split('T')[0],
+        gigId: req.body.gigId, projectId: req.body.projectId
+      };
+      syncUserBalances();
+    }
+    const enriched = enrichOrderWithServiceInfo(newOrd);
+    orders.unshift(enriched);
+    res.status(201).json(enriched);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 // Admin Proposals Management Endpoints
@@ -2966,7 +2974,7 @@ app.patch('/api/admin/users/:id', (req, res) => {
   if (req.body.bio !== undefined) u.bio = req.body.bio;
   if (req.body.skills !== undefined) u.skills = Array.isArray(req.body.skills) ? req.body.skills : req.body.skills.split(',').map((s: string) => s.trim()).filter(Boolean);
   if (req.body.hourlyRate !== undefined) u.hourlyRate = Number(req.body.hourlyRate);
-  if (req.body.walletBalance !== undefined) u.walletBalance = Number(req.body.walletBalance);
+  // walletBalance is ledger-controlled and intentionally ignored here (use /api/admin/finance/adjustments)
   if (req.body.verified !== undefined) u.verified = Boolean(req.body.verified);
   if (req.body.status !== undefined) u.status = req.body.status;
 
@@ -3067,6 +3075,13 @@ app.delete('/api/admin/users/:id', (req, res) => {
   const index = users.findIndex(user => user.id === req.params.id);
   if (index === -1) return res.status(404).json({ error: 'User not found' });
 
+  const target = users[index];
+  if (financeLedger.hasOutstandingFunds(target.id)) {
+    return res.status(409).json({ error: 'User still has wallet funds, pending withdrawals or active escrow. Resolve these before deleting the account.' });
+  }
+  if (orders.some(o => (o.buyerId === target.id || o.sellerId === target.id) && o.status !== 'completed' && o.status !== 'cancelled' && o.amount > 0)) {
+    return res.status(409).json({ error: 'User has active paid orders. Complete or cancel them first.' });
+  }
   const deletedUser = users[index];
   users.splice(index, 1);
 
@@ -3087,22 +3102,40 @@ app.delete('/api/admin/users/:id', (req, res) => {
   res.json({ success: true, id: deletedUser.id });
 });
 
-// Dispute Resolution Endpoint
+// Dispute Resolution Endpoint: final outcomes actually move the escrowed money
 app.patch('/api/admin/disputes/:id/resolve', (req, res) => {
-  const d = disputes.find(disp => disp.id === req.params.id);
-  if (!d) return res.status(404).json({ error: 'Dispute not found' });
-  d.status = req.body.status;
-  d.resolutionNotes = req.body.notes;
-  auditLogs.unshift({
-    id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
-    action: 'DISPUTE_RESOLVED',
-    target: `Dispute #${d.id}`,
-    details: `Resolved dispute with status ${req.body.status}. Notes: ${req.body.notes}`,
-    timestamp: new Date().toLocaleString()
-  });
-  res.json(d);
+  try {
+    const d = disputes.find(disp => disp.id === req.params.id);
+    if (!d) return res.status(404).json({ error: 'Dispute not found' });
+    const status = req.body.status as Dispute['status'];
+    if (!['open', 'under_investigation', 'resolved_refund', 'resolved_release', 'resolved_partial'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid dispute status.' });
+    }
+    if (d.status.startsWith('resolved')) return res.status(409).json({ error: `Dispute is already ${d.status}.` });
+    const notes = String(req.body.notes || '');
+    const reason = notes.trim().length >= 5 ? notes.trim() : 'Dispute resolved by administrator';
+    const order = orders.find(o => o.id === d.orderId);
+    if (status.startsWith('resolved')) {
+      if (!order) return res.status(404).json({ error: 'Order for this dispute not found' });
+      if (status === 'resolved_release') releaseOrderFunds(order, adminActor(req), reason);
+      else if (status === 'resolved_refund') refundOrderFunds(order, undefined, adminActor(req), reason);
+      else splitOrderFunds(order, Number(req.body.refundAmount), adminActor(req), reason);
+    }
+    d.status = status;
+    d.resolutionNotes = notes;
+    auditLogs.unshift({
+      id: 'log_' + randomUUID().slice(0, 12),
+      actor: adminActor(req),
+      role: 'super_admin',
+      action: 'DISPUTE_RESOLVED',
+      target: `Dispute #${d.id}`,
+      details: `Resolved dispute with status ${status}. Notes: ${notes}`,
+      timestamp: new Date().toLocaleString()
+    });
+    res.json(d);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 // Support Ticket Reply Endpoint

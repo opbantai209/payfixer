@@ -69862,7 +69862,7 @@ function verifyAuthTokenMiddleware(req, res, next) {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith("Bearer ")) {
     const token = authHeader.slice(7).trim();
-    if (token === ADMIN_TOKEN || token === "test_admin_token") {
+    if (token === ADMIN_TOKEN) {
       req.user = { id: "user_admin", role: "super_admin", email: "admin@workperhour.com" };
       return next();
     }
@@ -69881,8 +69881,8 @@ function resolveAuthenticatedUserId(req) {
 }
 var resolveUserId = resolveAuthenticatedUserId;
 app.post("/api/auth/login", (req, res) => {
-  const { userId, email } = req.body || {};
-  const user = users.find((u) => u.id === userId || u.email === email);
+  const { userId, email, password } = req.body || {};
+  const user = users.find((u) => (u.id === userId || u.email === email) && u.password === password);
   if (!user) {
     return res.status(401).json({ error: "Invalid credentials or user not found" });
   }
@@ -69918,6 +69918,26 @@ function adminActor(req) {
     return "Admin API Token";
   }
   return "Administrator";
+}
+function ALLOWED_ROLES_CHECK(role, allowed) {
+  if (role === "super_admin") return true;
+  return allowed.includes(role);
+}
+function requireRole(allowedRoles) {
+  return (req, res, next) => {
+    if (ADMIN_TOKEN && req.headers.authorization) {
+      const header = String(req.headers.authorization || "");
+      const given = header.startsWith("Bearer ") ? header.slice(7) : "";
+      if (given && given === ADMIN_TOKEN) return next();
+    }
+    const userId = resolveAuthenticatedUserId(req);
+    const u = users.find((user) => user.id === userId);
+    if (!u) return res.status(401).json({ error: "Authentication required" });
+    if (!ALLOWED_ROLES_CHECK(u.role, allowedRoles)) {
+      return res.status(403).json({ error: `Forbidden: Insufficient privileges (required: ${allowedRoles.join(", ")})` });
+    }
+    next();
+  };
 }
 function requireAdmin(req, res, next) {
   if (ADMIN_TOKEN) {
@@ -70063,7 +70083,8 @@ var users = [
     status: "active",
     verified: true,
     walletBalance: 4250,
-    createdAt: "2025-01-15"
+    createdAt: "2025-01-15",
+    password: "password123"
   },
   {
     id: "user_2",
@@ -70082,7 +70103,8 @@ var users = [
     status: "active",
     verified: true,
     walletBalance: 12e3,
-    createdAt: "2025-02-01"
+    createdAt: "2025-02-01",
+    password: "password123"
   },
   {
     id: "user_admin",
@@ -70101,7 +70123,8 @@ var users = [
     status: "active",
     verified: true,
     walletBalance: 0,
-    createdAt: "2025-01-01"
+    createdAt: "2025-01-01",
+    password: "adminpassword123"
   },
   {
     id: "user_bk",
@@ -72174,7 +72197,7 @@ app.delete("/api/admin/categories/:id/subcategories/:subId", (req, res) => {
   res.json(categories);
 });
 app.get("/api/reviews", (req, res) => res.json(reviews));
-app.get("/api/support-tickets", (req, res) => res.json(supportTickets));
+app.get("/api/support-tickets", requireRole(["admin", "super_admin", "support"]), (req, res) => res.json(supportTickets));
 app.get("/api/audit-logs", (req, res) => res.json(auditLogs));
 app.get("/api/user-emails/:userId", (req, res) => {
   const authUserId = resolveUserId(req);
@@ -72783,12 +72806,16 @@ var clients = /* @__PURE__ */ new Set();
 wss.on("connection", (ws, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const token = url.searchParams.get("token");
-  if (token) {
-    const payload = verifyToken(token);
-    if (payload) {
-      ws.authenticatedUserId = payload.id;
-    }
+  if (!token) {
+    ws.close(1008, "Authentication token required");
+    return;
   }
+  const payload = verifyToken(token);
+  if (!payload) {
+    ws.close(1008, "Invalid authentication token");
+    return;
+  }
+  ws.authenticatedUserId = payload.id;
   clients.add(ws);
   ws.on("message", (data) => {
     try {
@@ -72813,10 +72840,15 @@ wss.on("connection", (ws, req) => {
           timestamp: (/* @__PURE__ */ new Date()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
         };
         messages.push(newMsg);
-        const payload = JSON.stringify({ type: "MESSAGE_RECEIVED", message: newMsg });
+        const payload2 = JSON.stringify({ type: "MESSAGE_RECEIVED", message: newMsg });
         for (const client of clients) {
-          if (client.readyState === import_websocket.default.OPEN) {
-            client.send(payload);
+          const clientUserId = client.authenticatedUserId;
+          if (clientUserId) {
+            const clientUser = users.find((u) => u.id === clientUserId);
+            const isAuthorized2 = clientUser && (["admin", "super_admin", "support"].includes(clientUser.role) || clientUserId === order.buyerId || clientUserId === order.sellerId);
+            if (isAuthorized2 && client.readyState === import_websocket.default.OPEN) {
+              client.send(payload2);
+            }
           }
         }
       }

@@ -148,10 +148,11 @@ function ALLOWED_ROLES_CHECK(role: string, allowed: string[]) {
 
 function requireRole(allowedRoles: string[]) {
   return (req: Request, res: Response, next: NextFunction) => {
-    if (ADMIN_TOKEN && req.headers.authorization) {
-      const header = String(req.headers.authorization || '');
+    if (req.headers.authorization) {
+      const header = String(req.headers.authorization);
       const given = header.startsWith('Bearer ') ? header.slice(7) : '';
-      if (given && given === ADMIN_TOKEN) return next();
+      if (ADMIN_TOKEN && given === ADMIN_TOKEN) return next();
+      return res.status(401).json({ error: 'Invalid authentication token' });
     }
     const userId = resolveAuthenticatedUserId(req);
     const u = users.find(user => user.id === userId);
@@ -169,18 +170,14 @@ function requireAdmin(req: Request, res: Response, next: NextFunction) {
     const header = String(req.headers.authorization || '');
     const given = header.startsWith('Bearer ') ? header.slice(7) : '';
     if (given && given === ADMIN_TOKEN) return next();
+    return res.status(401).json({ error: 'Invalid authentication token' });
   }
   const userId = resolveAuthenticatedUserId(req);
   const u = users.find(user => user.id === userId);
   if (u && (u.role === 'admin' || u.role === 'super_admin')) {
     return next();
   }
-  if (!ADMIN_TOKEN) {
-    if (IS_PROD) return res.status(503).json({ error: 'ADMIN_API_TOKEN is not configured; admin endpoints are disabled.' });
-    if (u && (u.role === 'admin' || u.role === 'super_admin')) return next();
-    return res.status(403).json({ error: 'Admin authorization required.' });
-  }
-  return res.status(401).json({ error: 'Admin authorization required.' });
+  return res.status(401).json({ error: 'Access denied' });
 }
 
 
@@ -202,7 +199,23 @@ app.use('/api/admin', requireAdmin);
 for (const sub of ['force-complete', 'force-cancel', 'admin-notes', 'extend-time', 'mute']) {
   app.use(`/api/orders/:id/${sub}`, requireAdmin);
 }
-app.use(['/api/payouts', '/api/refunds', '/api/audit-logs'], (req: Request, res: Response, next: NextFunction) => (req.method === 'GET' ? requireAdmin(req, res, next) : next()));
+app.use(['/api/payouts', '/api/refunds', '/api/audit-logs'], (req: Request, res: Response, next: NextFunction) => {
+  if (req.method === 'GET') {
+    if (!req.headers.authorization && !resolveAuthenticatedUserId(req)) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+    const userId = resolveAuthenticatedUserId(req);
+    const u = users.find(user => user.id === userId);
+    if (req.headers.authorization && ADMIN_TOKEN) {
+        return requireAdmin(req, res, next);
+    }
+    if (u && (u.role === 'admin' || u.role === 'super_admin')) {
+        return requireAdmin(req, res, next);
+    }
+    return res.status(401).json({ error: 'Access denied' });
+  }
+  return next();
+});
 
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
@@ -2958,14 +2971,26 @@ app.delete('/api/admin/categories/:id/subcategories/:subId', (req, res) => {
   res.json(categories);
 });
 app.get('/api/reviews', (req, res) => res.json(reviews));
-app.get('/api/support-tickets', (req, res) => res.json(supportTickets));
-app.get('/api/audit-logs', (req, res) => res.json(auditLogs));
+app.get('/api/support-tickets', requireAuth, (req, res) => {
+  const authUserId = (req as any).authenticatedUserId;
+  const caller = users.find(u => u.id === authUserId);
+  if (!caller) return res.status(401).json({ error: 'User not found' });
+
+  const isAdmin = caller.role === 'admin' || caller.role === 'super_admin' || caller.role === 'support';
+
+  if (isAdmin) {
+    res.json(supportTickets);
+  } else {
+    res.json(supportTickets.filter(t => t.userId === authUserId));
+  }
+});
+app.get('/api/audit-logs', requireRole(['admin', 'super_admin']), (req, res) => res.json(auditLogs));
 
 // User Email Notifications API
 app.get('/api/user-emails/:userId', (req, res) => {
   const authUserId = resolveUserId(req);
   const caller = users.find(u => u.id === authUserId);
-  const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin' || (ADMIN_TOKEN && req.headers.authorization);
+  const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin' || (req.headers.authorization && ADMIN_TOKEN && String(req.headers.authorization).replace('Bearer ', '') === ADMIN_TOKEN);
   if (!isAdmin && authUserId !== req.params.userId) {
     return res.status(403).json({ error: 'Unauthorized: Cannot view another user email notifications.' });
   }
@@ -2978,7 +3003,7 @@ app.patch('/api/user-emails/:id/read', (req, res) => {
   const em = userEmails.find(e => e.id === req.params.id);
   if (!em) return res.status(404).json({ error: 'Notification not found' });
   const caller = users.find(u => u.id === authUserId);
-  const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin' || (ADMIN_TOKEN && req.headers.authorization);
+  const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin' || (req.headers.authorization && ADMIN_TOKEN && String(req.headers.authorization).replace('Bearer ', '') === ADMIN_TOKEN);
   if (!isAdmin && em.userId !== authUserId) {
     return res.status(403).json({ error: 'Unauthorized.' });
   }
@@ -3027,7 +3052,7 @@ app.get('/api/messages/:orderId', (req, res) => {
   const authUserId = resolveUserId(req);
   const order = orders.find(o => o.id === req.params.orderId);
   const caller = users.find(u => u.id === authUserId);
-  const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin' || (ADMIN_TOKEN && req.headers.authorization);
+  const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin' || (req.headers.authorization && ADMIN_TOKEN && String(req.headers.authorization).replace('Bearer ', '') === ADMIN_TOKEN);
   if (!isAdmin && order && order.buyerId !== authUserId && order.sellerId !== authUserId) {
     return res.status(403).json({ error: 'Unauthorized: Cannot view messages for an order you do not belong to.' });
   }
@@ -3667,12 +3692,19 @@ const clients = new Set<WebSocket>();
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url!, `http://${req.headers.host}`);
   const token = url.searchParams.get('token');
-  if (token) {
-    const payload = verifyToken(token);
-    if (payload) {
-      (ws as any).authenticatedUserId = payload.id;
-    }
+  
+  if (!token) {
+    ws.close(1008, 'Authentication token required');
+    return;
   }
+  
+  const payload = verifyToken(token);
+  if (!payload) {
+    ws.close(1008, 'Invalid authentication token');
+    return;
+  }
+  
+  (ws as any).authenticatedUserId = payload.id;
 
   clients.add(ws);
 
@@ -3705,9 +3737,21 @@ wss.on('connection', (ws, req) => {
         messages.push(newMsg);
 
         const payload = JSON.stringify({ type: 'MESSAGE_RECEIVED', message: newMsg });
+        
+        // Broadcast WebSocket to authorized parties only
         for (const client of clients) {
-          if (client.readyState === WebSocket.OPEN) {
-            client.send(payload);
+          const clientUserId = (client as any).authenticatedUserId;
+          if (clientUserId) {
+            const clientUser = users.find(u => u.id === clientUserId);
+            const isAuthorized = clientUser && (
+              ['admin', 'super_admin', 'support'].includes(clientUser.role) ||
+              clientUserId === order.buyerId ||
+              clientUserId === order.sellerId
+            );
+            
+            if (isAuthorized && client.readyState === WebSocket.OPEN) {
+              client.send(payload);
+            }
           }
         }
       }

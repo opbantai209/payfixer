@@ -69831,6 +69831,9 @@ financeLedger.configure({
   minimumWithdrawalAmount: DEFAULT_SITE_SETTINGS.wallets.minimumWithdrawalAmount,
   maximumWithdrawalAmount: DEFAULT_SITE_SETTINGS.wallets.maximumWithdrawalPerTransaction
 });
+if (process.env.NODE_ENV === "production" && !process.env.JWT_SECRET) {
+  throw new Error("JWT_SECRET must be set in production");
+}
 var JWT_SECRET = process.env.JWT_SECRET || randomUUID2() + randomUUID2();
 function signToken(payload, expiresInMs = 7 * 24 * 3600 * 1e3) {
   const data = JSON.stringify({ ...payload, exp: Date.now() + expiresInMs });
@@ -69899,6 +69902,10 @@ app.post("/api/auth/login", (req, res) => {
     }
   });
 });
+function safeUser(user) {
+  const { password, ...safe } = user;
+  return safe;
+}
 function requireAuth(req, res, next) {
   const userId = resolveAuthenticatedUserId(req);
   if (!userId) {
@@ -70067,13 +70074,19 @@ If you have any questions or security concerns, please contact support immediate
     timestamp: timeShort
   };
   messages.push(newChatMsg);
-  try {
-    const payload = JSON.stringify({ type: "MESSAGE_RECEIVED", message: newChatMsg });
+  function notifyUser(message, targetUserId) {
+    const payload = JSON.stringify({ type: "MESSAGE_RECEIVED", message });
     for (const client of clients) {
-      if (client.readyState === import_websocket.default.OPEN) {
+      const clientUserId = client.authenticatedUserId;
+      const clientUser = users.find((u) => u.id === clientUserId);
+      const isAuthorized = clientUser && (["admin", "super_admin", "support"].includes(clientUser.role) || clientUserId === targetUserId);
+      if (isAuthorized && client.readyState === import_websocket.default.OPEN) {
         client.send(payload);
       }
     }
+  }
+  try {
+    notifyUser(newChatMsg, user.id);
   } catch (err) {
     console.error("WS notify error:", err);
   }
@@ -70097,7 +70110,7 @@ var users = [
     verified: true,
     walletBalance: 4250,
     createdAt: "2025-01-15",
-    password: "password123"
+    password: IS_PROD ? randomUUID2() : "password123"
   },
   {
     id: "user_2",
@@ -70117,7 +70130,7 @@ var users = [
     verified: true,
     walletBalance: 12e3,
     createdAt: "2025-02-01",
-    password: "password123"
+    password: IS_PROD ? randomUUID2() : "password123"
   },
   {
     id: "user_admin",
@@ -70137,7 +70150,7 @@ var users = [
     verified: true,
     walletBalance: 0,
     createdAt: "2025-01-01",
-    password: "adminpassword123"
+    password: IS_PROD ? randomUUID2() : "adminpassword123"
   },
   {
     id: "user_bk",
@@ -70928,7 +70941,9 @@ function splitOrderFunds(order, refundAmount, actor, reason, requestKey) {
   if (requestKey) requestKeyCache.set(requestKey, result);
   return result;
 }
-app.get("/api/users", (req, res) => res.json(users));
+app.get("/api/users", requireRole(["admin", "super_admin"]), (req, res) => {
+  res.json(users.map(safeUser));
+});
 app.get("/api/gigs", (req, res) => res.json(gigs));
 app.get("/api/projects", (req, res) => res.json(projects));
 app.get("/api/proposals", (req, res) => res.json(proposals));
@@ -70936,9 +70951,15 @@ app.get("/api/orders", (req, res) => {
   const enriched = orders.map(enrichOrderWithServiceInfo);
   res.json(enriched);
 });
-app.get("/api/orders/:id", (req, res) => {
+app.get("/api/orders/:id", requireAuth, (req, res) => {
   const order = orders.find((o) => o.id === req.params.id);
   if (!order) return res.status(404).json({ error: "Order not found" });
+  const authUserId = req.authenticatedUserId;
+  const caller = users.find((u) => u.id === authUserId);
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || caller?.role === "support";
+  if (!isAdmin && order.buyerId !== authUserId && order.sellerId !== authUserId) {
+    return res.status(403).json({ error: "Unauthorized" });
+  }
   const enriched = enrichOrderWithServiceInfo(order);
   const buyer = users.find((u) => u.id === order.buyerId);
   const seller = users.find((u) => u.id === order.sellerId);
@@ -71200,8 +71221,14 @@ var customInvoices = [
     relatedOrderId: "ord_1"
   }
 ];
-app.get("/api/payments/user/:userId", (req, res) => {
+app.get("/api/payments/user/:userId", requireAuth, (req, res) => {
   try {
+    const authUserId = req.authenticatedUserId;
+    const caller = users.find((u2) => u2.id === authUserId);
+    const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || caller?.role === "support";
+    if (!isAdmin && authUserId !== req.params.userId) {
+      return res.status(403).json({ error: "Unauthorized" });
+    }
     const userId = req.params.userId;
     const u = users.find((user) => user.id === userId);
     if (u) {
@@ -71673,7 +71700,7 @@ app.patch("/api/payments/methods/:id/default", requireAuth, (req, res) => {
   method.isDefault = true;
   res.json(method);
 });
-app.get("/api/admin/finance/overview", (req, res) => {
+app.get("/api/admin/finance/overview", requireRole(["admin", "super_admin"]), (req, res) => {
   try {
     const overview = financeLedger.getFinancialOverview();
     res.json(overview);
@@ -72211,22 +72238,22 @@ app.get("/api/support-tickets", requireAuth, (req, res) => {
   }
 });
 app.get("/api/audit-logs", requireRole(["admin", "super_admin"]), (req, res) => res.json(auditLogs));
-app.get("/api/user-emails/:userId", (req, res) => {
-  const authUserId = resolveUserId(req);
+app.get("/api/user-emails/:userId", requireAuth, (req, res) => {
+  const authUserId = req.authenticatedUserId;
   const caller = users.find((u) => u.id === authUserId);
-  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || req.headers.authorization && ADMIN_TOKEN && String(req.headers.authorization).replace("Bearer ", "") === ADMIN_TOKEN;
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin";
   if (!isAdmin && authUserId !== req.params.userId) {
     return res.status(403).json({ error: "Unauthorized: Cannot view another user email notifications." });
   }
   const userList = userEmails.filter((e2) => e2.userId === req.params.userId);
   res.json(userList);
 });
-app.patch("/api/user-emails/:id/read", (req, res) => {
-  const authUserId = resolveUserId(req);
+app.patch("/api/user-emails/:id/read", requireAuth, (req, res) => {
+  const authUserId = req.authenticatedUserId;
   const em = userEmails.find((e2) => e2.id === req.params.id);
   if (!em) return res.status(404).json({ error: "Notification not found" });
   const caller = users.find((u) => u.id === authUserId);
-  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || req.headers.authorization && ADMIN_TOKEN && String(req.headers.authorization).replace("Bearer ", "") === ADMIN_TOKEN;
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin";
   if (!isAdmin && em.userId !== authUserId) {
     return res.status(403).json({ error: "Unauthorized." });
   }
@@ -72264,11 +72291,11 @@ app.post("/api/support-tickets", requireAuth, (req, res) => {
   });
   res.json(newTicket);
 });
-app.get("/api/messages/:orderId", (req, res) => {
-  const authUserId = resolveUserId(req);
+app.get("/api/messages/:orderId", requireAuth, (req, res) => {
+  const authUserId = req.authenticatedUserId;
   const order = orders.find((o) => o.id === req.params.orderId);
   const caller = users.find((u) => u.id === authUserId);
-  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || req.headers.authorization && ADMIN_TOKEN && String(req.headers.authorization).replace("Bearer ", "") === ADMIN_TOKEN;
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin";
   if (!isAdmin && order && order.buyerId !== authUserId && order.sellerId !== authUserId) {
     return res.status(403).json({ error: "Unauthorized: Cannot view messages for an order you do not belong to." });
   }

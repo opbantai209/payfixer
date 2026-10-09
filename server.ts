@@ -122,6 +122,11 @@ app.post('/api/auth/login', (req, res) => {
   });
 });
 
+function safeUser(user: any) {
+  const { password, ...safe } = user;
+  return safe;
+}
+
 function requireAuth(req: Request, res: Response, next: NextFunction) {
   const userId = resolveAuthenticatedUserId(req);
   if (!userId) {
@@ -504,14 +509,26 @@ function notifyUserOnAdminAction(user: User, action: 'suspended' | 'restricted' 
   };
   messages.push(newChatMsg);
 
+function notifyUser(message: Message, targetUserId: string) {
+  const payload = JSON.stringify({ type: 'MESSAGE_RECEIVED', message });
+  for (const client of clients) {
+    const clientUserId = (client as any).authenticatedUserId;
+    const clientUser = users.find(u => u.id === clientUserId);
+    const isAuthorized = clientUser && (
+      ['admin', 'super_admin', 'support'].includes(clientUser.role) ||
+      clientUserId === targetUserId
+    );
+    
+    if (isAuthorized && client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+    }
+  }
+}
+
+// ... somewhere ...
   // 3. Broadcast WS message
   try {
-    const payload = JSON.stringify({ type: 'MESSAGE_RECEIVED', message: newChatMsg });
-    for (const client of clients) {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(payload);
-      }
-    }
+    notifyUser(newChatMsg, user.id);
   } catch (err) {
     console.error('WS notify error:', err);
   }
@@ -1436,7 +1453,9 @@ function splitOrderFunds(order: Order, refundAmount: number, actor: string, reas
   return result;
 }
 
-app.get('/api/users', (req, res) => res.json(users));
+app.get('/api/users', requireRole(['admin', 'super_admin']), (req, res) => {
+  res.json(users.map(safeUser));
+});
 app.get('/api/gigs', (req, res) => res.json(gigs));
 app.get('/api/projects', (req, res) => res.json(projects));
 app.get('/api/proposals', (req, res) => res.json(proposals));
@@ -1446,9 +1465,15 @@ app.get('/api/orders', (req, res) => {
 });
 
 // Single Order Workspace Detail
-app.get('/api/orders/:id', (req, res) => {
+app.get('/api/orders/:id', requireAuth, (req, res) => {
   const order = orders.find(o => o.id === req.params.id);
   if (!order) return res.status(404).json({ error: 'Order not found' });
+  const authUserId = (req as any).authenticatedUserId;
+  const caller = users.find(u => u.id === authUserId);
+  const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin' || caller?.role === 'support';
+  if (!isAdmin && order.buyerId !== authUserId && order.sellerId !== authUserId) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
   const enriched = enrichOrderWithServiceInfo(order);
   const buyer = users.find(u => u.id === order.buyerId);
   const seller = users.find(u => u.id === order.sellerId);
@@ -1808,8 +1833,16 @@ let customInvoices: CustomInvoice[] = [
 ];
 
 // User Financial Overview Snapshot
-app.get('/api/payments/user/:userId', (req, res) => {
+app.get('/api/payments/user/:userId', requireAuth, (req, res) => {
   try {
+    const authUserId = (req as any).authenticatedUserId;
+    const caller = users.find(u => u.id === authUserId);
+    const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin' || caller?.role === 'support';
+    
+    if (!isAdmin && authUserId !== req.params.userId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
     const userId = req.params.userId;
     const u = users.find(user => user.id === userId);
     
@@ -2375,7 +2408,7 @@ app.patch('/api/payments/methods/:id/default', requireAuth, (req, res) => {
 // ==========================================
 
 // 1. Overview Financial Metrics Dashboard
-app.get('/api/admin/finance/overview', (req, res) => {
+app.get('/api/admin/finance/overview', requireRole(['admin', 'super_admin']), (req, res) => {
   try {
     const overview = financeLedger.getFinancialOverview();
     res.json(overview);

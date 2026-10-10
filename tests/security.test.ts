@@ -187,9 +187,9 @@ async function run() {
     assert.strictEqual(adm2.status, 401, 'Invalid Auth token denied');
     console.log('[PASS] Invalid Auth token denied for admin route');
 
-    // normal user token => denied
+    // normal user token => denied (401 or 403)
     const adm3 = await api('/api/audit-logs', { headers: { 'Authorization': `Bearer ${token1}` } });
-    assert.strictEqual(adm3.status, 401, 'Normal user token denied');
+    assert.strictEqual(adm3.status === 401 || adm3.status === 403, true, 'Normal user token denied with 401 or 403');
     console.log('[PASS] Normal user token denied for admin route');
 
     // valid admin token => allowed
@@ -1018,7 +1018,39 @@ async function run() {
       assert.strictEqual(orderData.seller.completedJobs, undefined, 'Seller completedJobs must not be exposed');
       assert.strictEqual(orderData.seller.email, undefined, 'Seller email must not be exposed to other participant');
     }
-    console.log('[PASS] Order participants cannot see each other private financial/profile data');
+    // =========================================================================
+    // REGRESSION TEST: ADMIN ORDER MODIFICATION & FINANCIAL DATA AUTHENTICATION
+    // =========================================================================
+    console.log('\n--- RUNNING ADMIN ORDER MODIFICATION & FINANCIAL AUTHENTICATION TESTS ---');
+
+    // 1. Unauthenticated / non-admin order admin actions should be blocked
+    const unauthAdminNotes = await api('/api/orders/ord_1/admin-notes', {
+      method: 'POST',
+      body: { notes: 'hacked' }
+    });
+    assert.notStrictEqual(unauthAdminNotes.status, 200, 'Unauthenticated admin-notes must be blocked');
+
+    const unauthExtendTime = await api('/api/orders/ord_1/extend-time', {
+      method: 'PATCH',
+      body: { days: 5 }
+    });
+    assert.notStrictEqual(unauthExtendTime.status, 200, 'Unauthenticated extend-time must be blocked');
+
+    const nonAdminNotes = await api('/api/orders/ord_1/admin-notes', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token1}` },
+      body: { notes: 'hacked by non-admin' }
+    });
+    assert.notStrictEqual(nonAdminNotes.status, 200, 'Non-admin user cannot modify admin-notes');
+
+    // 2. Unauthenticated financial endpoints /api/refunds and /api/payouts must be blocked
+    const unauthRefunds = await api('/api/refunds');
+    assert.strictEqual(unauthRefunds.status, 401, 'Unauthenticated GET /api/refunds must return 401');
+
+    const unauthPayouts = await api('/api/payouts');
+    assert.strictEqual(unauthPayouts.status, 401, 'Unauthenticated GET /api/payouts must return 401');
+
+    console.log('[PASS] Admin endpoints and financial endpoints are correctly secured');
 
     console.log('\nSECURITY TEST SUMMARY: PASSED');
     process.exit(0);

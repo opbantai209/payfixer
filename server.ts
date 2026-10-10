@@ -433,26 +433,13 @@ function rateLimit(max: number, windowMs: number) {
 
 // Everything under /api/admin and the order admin actions require the admin token.
 app.use('/api/admin', requireAdmin);
-for (const sub of ['force-complete', 'force-cancel', 'admin-notes', 'extend-time', 'mute']) {
-  app.use(`/api/orders/:id/${sub}`, requireAdmin);
-}
-app.use(['/api/payouts', '/api/refunds', '/api/audit-logs'], (req: Request, res: Response, next: NextFunction) => {
-  if (req.method === 'GET') {
-    if (!req.headers.authorization && !resolveAuthenticatedUserId(req)) {
-      return res.status(401).json({ error: 'Authentication required' });
-    }
-    const userId = resolveAuthenticatedUserId(req);
-    const u = users.find(user => user.id === userId);
-    if (req.headers.authorization && ADMIN_TOKEN) {
-        return requireAdmin(req, res, next);
-    }
-    if (u && (u.role === 'admin' || u.role === 'super_admin')) {
-        return requireAdmin(req, res, next);
-    }
-    return res.status(401).json({ error: 'Access denied' });
-  }
-  return next();
-});
+app.use('/api/audit-logs', requireAdmin);
+app.use('/api/orders/:id/admin-notes', requireAdmin);
+app.use('/api/orders/:id/extend-time', requireAdmin);
+app.use('/api/orders/:id/force-complete', requireAdmin);
+app.use('/api/orders/:id/force-cancel', requireAdmin);
+app.use('/api/orders/:id/mute', requireAdmin);
+
 
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
@@ -1835,7 +1822,7 @@ app.get('/api/orders/:id', requireAuth, (req, res) => {
 });
 
 // Extend Order Deadline
-app.patch('/api/orders/:id/extend-time', (req, res) => {
+app.patch('/api/orders/:id/extend-time', requireAdmin, (req, res) => {
   const order = orders.find(o => o.id === req.params.id);
   if (!order) return res.status(404).json({ error: 'Order not found' });
 
@@ -1878,7 +1865,7 @@ app.patch('/api/orders/:id/extend-time', (req, res) => {
 });
 
 // Save Admin Private Notes
-app.post('/api/orders/:id/admin-notes', (req, res) => {
+app.post('/api/orders/:id/admin-notes', requireAdmin, (req, res) => {
   const order = orders.find(o => o.id === req.params.id);
   if (!order) return res.status(404).json({ error: 'Order not found' });
 
@@ -2100,8 +2087,28 @@ app.get('/api/disputes', requireAuth, (req, res) => {
   });
   res.json(userDisputes);
 });
-app.get('/api/refunds', (req, res) => res.json(refunds));
-app.get('/api/payouts', (req, res) => res.json(payouts));
+app.get('/api/refunds', requireAuth, (req, res) => {
+  const authUserId = (req as any).authenticatedUserId;
+  const caller = users.find(u => u.id === authUserId);
+  const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin' || caller?.role === 'support';
+  const userRefunds = refunds.filter(r => {
+    if (isAdmin) return true;
+    if (r.buyerId === authUserId) return true;
+    const order = orders.find(o => o.id === r.orderId);
+    return order && (order.buyerId === authUserId || order.sellerId === authUserId);
+  });
+  res.json(userRefunds);
+});
+app.get('/api/payouts', requireAuth, (req, res) => {
+  const authUserId = (req as any).authenticatedUserId;
+  const caller = users.find(u => u.id === authUserId);
+  const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin' || caller?.role === 'support';
+  const userPayouts = payouts.filter(p => {
+    if (isAdmin) return true;
+    return p.freelancerId === authUserId;
+  });
+  res.json(userPayouts);
+});
 app.get('/api/categories', (req, res) => res.json(categories));
 
 // ==========================================

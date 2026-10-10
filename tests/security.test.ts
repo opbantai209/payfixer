@@ -997,6 +997,29 @@ async function run() {
     assert.strictEqual(successAfterCooldown.status, 200, 'Legitimate login succeeds after cooldown');
     console.log('[PASS] Legitimate login remains possible after the appropriate cooldown');
 
+    // =========================================================================
+    // REGRESSION TEST: ORDER PARTICIPANT FINANCIAL/PRIVATE DATA ISOLATION
+    // =========================================================================
+    console.log('\n--- RUNNING ORDER PARTICIPANT FINANCIAL DATA ISOLATION TESTS ---');
+    const orderDetailRes = await api('/api/orders/ord_1', {
+      headers: { 'Authorization': `Bearer ${token1}` }
+    });
+    assert.strictEqual(orderDetailRes.status, 200, 'User 1 can view order ord_1');
+    const orderData = orderDetailRes.json;
+    if (orderData.buyer) {
+      assert.strictEqual(orderData.buyer.walletBalance, undefined, 'Buyer walletBalance must not be exposed');
+      assert.strictEqual(orderData.buyer.earned, undefined, 'Buyer earned must not be exposed');
+      assert.strictEqual(orderData.buyer.completedJobs, undefined, 'Buyer completedJobs must not be exposed');
+      assert.strictEqual(orderData.buyer.email, undefined, 'Buyer email must not be exposed to other participant');
+    }
+    if (orderData.seller) {
+      assert.strictEqual(orderData.seller.walletBalance, undefined, 'Seller walletBalance must not be exposed');
+      assert.strictEqual(orderData.seller.earned, undefined, 'Seller earned must not be exposed');
+      assert.strictEqual(orderData.seller.completedJobs, undefined, 'Seller completedJobs must not be exposed');
+      assert.strictEqual(orderData.seller.email, undefined, 'Seller email must not be exposed to other participant');
+    }
+    console.log('[PASS] Order participants cannot see each other private financial/profile data');
+
     console.log('\nSECURITY TEST SUMMARY: PASSED');
     process.exit(0);
   } catch (err: any) {

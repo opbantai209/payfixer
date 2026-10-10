@@ -7,6 +7,7 @@ import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
 import { randomUUID, timingSafeEqual, createHmac } from 'crypto';
+import bcrypt from 'bcryptjs';
 import type { Request, Response, NextFunction } from 'express';
 import { financeLedger, FinanceLedgerEngine } from './src/server/financeLedger.js';
 import { DEFAULT_SITE_SETTINGS } from './src/server/siteSettings.js';
@@ -202,7 +203,7 @@ function recordLoginFailure(ip: string, accountKey: string, now: number) {
 }
 
 // Authentication Login Endpoint to issue verified signed JWT tokens with brute-force protection
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   if (!req.body || typeof req.body !== 'object') {
     return res.status(401).json({ error: 'Request body required' });
   }
@@ -246,10 +247,8 @@ app.post('/api/auth/login', (req, res) => {
     return res.status(401).json({ error: 'Invalid credentials or user not found' });
   }
 
-  // 4. Secure timing-safe password comparison
-  const suppliedBuf = Buffer.from(password);
-  const storedBuf = Buffer.from(user.password);
-  const isMatch = suppliedBuf.length === storedBuf.length && timingSafeEqual(suppliedBuf, storedBuf);
+  // 4. Secure password comparison using bcrypt hash verification
+  const isMatch = await bcrypt.compare(password, user.password);
 
   if (!isMatch) {
     recordLoginFailure(clientIp, accountKey, now);
@@ -278,8 +277,25 @@ app.post('/api/auth/login', (req, res) => {
 });
 
 function safeUser(user: any) {
-  const { password, ...safe } = user;
+  const { password, walletBalance, earned, completedJobs, ...safe } = user;
   return safe;
+}
+
+function orderParticipantSafeUser(user: any) {
+  if (!user) return null;
+  return {
+    id: user.id,
+    name: user.name,
+    username: user.username,
+    avatar: user.avatar,
+    title: user.title,
+    rating: user.rating,
+    reviewsCount: user.reviewsCount,
+    hourlyRate: user.hourlyRate,
+    skills: user.skills,
+    verified: user.verified,
+    status: user.status
+  };
 }
 
 function requireAuth(req: Request, res: Response, next: NextFunction) {
@@ -754,9 +770,9 @@ function notifyUser(message: Message, targetUserId: string) {
   }
 }
 
-// Development / Testing credentials - strictly isolated from production deployment
-const DEV_DEMO_PASSWORD = 'password123';
-const DEV_ADMIN_PASSWORD = 'adminpassword123';
+// Development / Testing credentials hashed with bcrypt
+const DEV_DEMO_PASSWORD_HASH = bcrypt.hashSync('password123', 10);
+const DEV_ADMIN_PASSWORD_HASH = bcrypt.hashSync('adminpassword123', 10);
 
 // Initial Data Seeds
 let users: User[] = [
@@ -778,7 +794,7 @@ let users: User[] = [
     verified: true,
     walletBalance: 4250,
     createdAt: '2025-01-15',
-    password: IS_PROD ? undefined : DEV_DEMO_PASSWORD
+    password: IS_PROD ? undefined : DEV_DEMO_PASSWORD_HASH
   },
   {
     id: 'user_2',
@@ -798,7 +814,7 @@ let users: User[] = [
     verified: true,
     walletBalance: 12000,
     createdAt: '2025-02-01',
-    password: IS_PROD ? undefined : DEV_DEMO_PASSWORD
+    password: IS_PROD ? undefined : DEV_DEMO_PASSWORD_HASH
   },
   {
     id: 'user_admin',
@@ -818,7 +834,7 @@ let users: User[] = [
     verified: true,
     walletBalance: 0,
     createdAt: '2025-01-01',
-    password: IS_PROD ? (process.env.ADMIN_PASSWORD || undefined) : DEV_ADMIN_PASSWORD
+    password: IS_PROD ? (process.env.ADMIN_PASSWORD ? bcrypt.hashSync(process.env.ADMIN_PASSWORD, 10) : undefined) : DEV_ADMIN_PASSWORD_HASH
   },
   {
     id: 'user_bk',
@@ -839,7 +855,7 @@ let users: User[] = [
     verified: true,
     walletBalance: 3450,
     createdAt: '2025-01-10',
-    password: IS_PROD ? undefined : DEV_DEMO_PASSWORD
+    password: IS_PROD ? undefined : DEV_DEMO_PASSWORD_HASH
   },
   {
     id: 'user_3',
@@ -860,7 +876,7 @@ let users: User[] = [
     verified: true,
     walletBalance: 1850,
     createdAt: '2025-02-15',
-    password: IS_PROD ? undefined : DEV_DEMO_PASSWORD
+    password: IS_PROD ? undefined : DEV_DEMO_PASSWORD_HASH
   }
 ];
 
@@ -1362,7 +1378,7 @@ let messages: Message[] = [
   }
 ];
 
-function enrichOrderWithServiceInfo(o: Order) {
+function enrichOrderWithServiceInfo(o: Order, isAdmin: boolean = false) {
   const gig = (o.gigId ? gigs.find(g => g.id === o.gigId) : undefined) ||
               gigs.find(g => g.freelancerId === o.sellerId) ||
               gigs.find(g => g.title.toLowerCase() === o.title.toLowerCase());
@@ -1377,7 +1393,7 @@ function enrichOrderWithServiceInfo(o: Order) {
   const serviceTitle = gig?.title || project?.title || o.serviceTitle || o.title;
   const serviceThumbnail = o.serviceThumbnail || gig?.image || 'https://images.unsplash.com/photo-1460925895917-afdab827c52f?w=800&h=500&fit=crop';
 
-  return {
+  const base = {
     ...o,
     gigId: o.gigId || gig?.id,
     projectId: o.projectId || project?.id,
@@ -1389,6 +1405,12 @@ function enrichOrderWithServiceInfo(o: Order) {
     serviceThumbnail,
     isTimerPaused: Boolean(o.isTimerPaused)
   };
+
+  if (!isAdmin) {
+    const { adminNotes, isMuted, ...sanitized } = base;
+    return sanitized;
+  }
+  return base;
 }
 
 // Site & Fee Settings State
@@ -1784,7 +1806,7 @@ app.get('/api/orders', requireAuth, (req, res) => {
   const caller = users.find(u => u.id === authUserId);
   const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin' || caller?.role === 'support';
   const userOrders = orders.filter(o => isAdmin || o.buyerId === authUserId || o.sellerId === authUserId);
-  res.json(userOrders.map(enrichOrderWithServiceInfo));
+  res.json(userOrders.map(o => enrichOrderWithServiceInfo(o, isAdmin)));
 });
 
 // Single Order Workspace Detail
@@ -1797,7 +1819,7 @@ app.get('/api/orders/:id', requireAuth, (req, res) => {
   if (!isAdmin && order.buyerId !== authUserId && order.sellerId !== authUserId) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
-  const enriched = enrichOrderWithServiceInfo(order);
+  const enriched = enrichOrderWithServiceInfo(order, isAdmin);
   const buyer = users.find(u => u.id === order.buyerId);
   const seller = users.find(u => u.id === order.sellerId);
   const orderMessages = messages.filter(m => m.orderId === order.id);
@@ -1805,8 +1827,8 @@ app.get('/api/orders/:id', requireAuth, (req, res) => {
 
   res.json({
     ...enriched,
-    buyer: buyer ? safeUser(buyer) : null,
-    seller: seller ? safeUser(seller) : null,
+    buyer: buyer ? (isAdmin ? safeUser(buyer) : orderParticipantSafeUser(buyer)) : null,
+    seller: seller ? (isAdmin ? safeUser(seller) : orderParticipantSafeUser(seller)) : null,
     messages: orderMessages,
     dispute
   });

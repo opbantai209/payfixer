@@ -19,14 +19,52 @@ const app = express();
 app.use(express.json({ limit: '100kb' }));
 
 // ==========================================
-// PAYMENT SECURITY LAYER
+// PRODUCTION / DEVELOPMENT SECURITY BOUNDARY
 // ==========================================
-const IS_PROD = process.env.NODE_ENV === 'production';
-if (IS_PROD && !process.env.ADMIN_API_TOKEN) {
-  throw new Error('ADMIN_API_TOKEN must be set in production');
+const isCompiledProductionBundle = path.basename(fileURLToPath(import.meta.url)).startsWith('server.js');
+const isNpmStart = process.env.npm_lifecycle_event === 'start';
+const isExplicitProd = process.env.NODE_ENV === 'production';
+const isTestEnv = process.env.NODE_ENV === 'test';
+
+// Enforce production mode for compiled production bundles or npm start, unless in test environment
+const IS_PROD = (isExplicitProd || isNpmStart || isCompiledProductionBundle) && !isTestEnv;
+
+if (IS_PROD) {
+  process.env.NODE_ENV = 'production';
+
+  // 1. Production must require persistent JWT_SECRET (never random ephemeral secrets)
+  if (!process.env.JWT_SECRET || process.env.JWT_SECRET.trim().length < 16) {
+    throw new Error('FATAL: A persistent JWT_SECRET (minimum 16 characters) must be explicitly configured in production.');
+  }
+
+  // 2. Production must require the required admin secret/configuration
+  if (!process.env.ADMIN_API_TOKEN || process.env.ADMIN_API_TOKEN.trim().length < 16) {
+    throw new Error('FATAL: A secure ADMIN_API_TOKEN (minimum 16 characters) must be explicitly configured in production.');
+  }
+
+  // 3. Production must never use known demo passwords
+  const KNOWN_DEMO_PASSWORDS = ['password123', 'adminpassword123', 'password', 'admin', '12345678', 'qwerty', 'admin123'];
+  if (process.env.ADMIN_PASSWORD && KNOWN_DEMO_PASSWORDS.includes(process.env.ADMIN_PASSWORD.trim().toLowerCase())) {
+    throw new Error('FATAL: Production ADMIN_PASSWORD cannot be set to a known demo or default password.');
+  }
 }
+
+// Production must never use random ephemeral authentication secrets
+const JWT_SECRET = IS_PROD
+  ? process.env.JWT_SECRET!
+  : (process.env.JWT_SECRET || 'dev-insecure-jwt-secret-local-only');
+
 const ADMIN_TOKEN = process.env.ADMIN_API_TOKEN || '';
 const REQUIRE_KYC_FOR_PAYOUTS = process.env.REQUIRE_KYC_FOR_PAYOUTS !== 'false';
+
+// Helper to determine whether simulated development deposits are permitted
+function areSimulatedDepositsAllowed(): boolean {
+  // Production must never allow simulated deposits under any circumstances
+  if (IS_PROD || process.env.NODE_ENV === 'production') {
+    return false;
+  }
+  return true;
+}
 
 // Feed business rules from the site settings into the ledger engine
 financeLedger.configure({
@@ -39,10 +77,6 @@ financeLedger.configure({
 // ==========================================
 // CRYPTOGRAPHIC AUTHENTICATION ADAPTER (JWT / Session)
 // ==========================================
-if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) {
-  throw new Error('JWT_SECRET must be set in production');
-}
-const JWT_SECRET = process.env.JWT_SECRET || randomUUID() + randomUUID();
 
 function signToken(payload: { id: string; role: string; email: string }, expiresInMs = 7 * 24 * 3600 * 1000): string {
   const data = JSON.stringify({ ...payload, exp: Date.now() + expiresInMs });
@@ -80,14 +114,25 @@ function verifyAuthTokenMiddleware(req: Request, res: Response, next: NextFuncti
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.slice(7).trim();
 
-    if (token === ADMIN_TOKEN) {
+    if (ADMIN_TOKEN && ADMIN_TOKEN.length > 0 && token === ADMIN_TOKEN) {
       (req as any).user = { id: 'user_admin', role: 'super_admin', email: 'admin@workperhour.com' };
       return next();
     }
 
     const payload = verifyToken(token);
     if (payload) {
-      (req as any).user = payload;
+      // Look up current server-side user state: do not trust role/status in stale token
+      const dbUser = users.find(u => u.id === payload.id);
+      if (dbUser) {
+        (req as any).user = {
+          id: dbUser.id,
+          role: dbUser.role,
+          status: dbUser.status,
+          email: dbUser.email
+        };
+      } else {
+        (req as any).user = payload;
+      }
     }
   }
   next();
@@ -104,15 +149,122 @@ function resolveAuthenticatedUserId(req: Request): string | null {
 
 const resolveUserId = resolveAuthenticatedUserId;
 
-// Authentication Login Endpoint to issue verified signed JWT tokens
+// Brute-force protection maps for /api/auth/login
+interface LoginFailureRecord {
+  count: number;
+  lockedUntil: number;
+}
+const loginFailuresByIP = new Map<string, LoginFailureRecord>();
+const loginFailuresByAccount = new Map<string, LoginFailureRecord>();
+
+const MAX_LOGIN_FAILURES = 5;
+const LOGIN_LOCKOUT_MS = process.env.NODE_ENV === 'test' ? 2000 : 30_000;
+
+function recordLoginFailure(ip: string, accountKey: string, now: number) {
+  let ipRec = loginFailuresByIP.get(ip);
+  if (!ipRec || ipRec.lockedUntil <= now) {
+    ipRec = { count: 1, lockedUntil: 0 };
+  } else {
+    ipRec.count++;
+  }
+  if (ipRec.count >= MAX_LOGIN_FAILURES) {
+    ipRec.lockedUntil = now + LOGIN_LOCKOUT_MS;
+  }
+  loginFailuresByIP.set(ip, ipRec);
+
+  if (accountKey) {
+    let accRec = loginFailuresByAccount.get(accountKey);
+    if (!accRec || accRec.lockedUntil <= now) {
+      accRec = { count: 1, lockedUntil: 0 };
+    } else {
+      accRec.count++;
+    }
+    if (accRec.count >= MAX_LOGIN_FAILURES) {
+      accRec.lockedUntil = now + LOGIN_LOCKOUT_MS;
+    }
+    loginFailuresByAccount.set(accountKey, accRec);
+  }
+
+  if (loginFailuresByIP.size > 500) {
+    for (const [k, v] of loginFailuresByIP.entries()) {
+      if (v.lockedUntil <= now && v.count < MAX_LOGIN_FAILURES) {
+        loginFailuresByIP.delete(k);
+      }
+    }
+  }
+  if (loginFailuresByAccount.size > 500) {
+    for (const [k, v] of loginFailuresByAccount.entries()) {
+      if (v.lockedUntil <= now && v.count < MAX_LOGIN_FAILURES) {
+        loginFailuresByAccount.delete(k);
+      }
+    }
+  }
+}
+
+// Authentication Login Endpoint to issue verified signed JWT tokens with brute-force protection
 app.post('/api/auth/login', (req, res) => {
-  const { userId, email, password } = req.body || {};
-  const user = users.find(u => (u.id === userId || u.email === email) && u.password === password);
-  if (!user) {
+  if (!req.body || typeof req.body !== 'object') {
+    return res.status(401).json({ error: 'Request body required' });
+  }
+
+  const clientIp = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1');
+  const now = Date.now();
+
+  const ipRecord = loginFailuresByIP.get(clientIp);
+  if (ipRecord && ipRecord.lockedUntil > now) {
+    const retryAfterSec = Math.ceil((ipRecord.lockedUntil - now) / 1000);
+    return res.status(429).json({ error: `Too many failed login attempts from this IP. Please try again in ${retryAfterSec} seconds.` });
+  }
+
+  const { userId, email, password } = req.body;
+
+  // 1. Password must always be explicitly supplied.
+  if (typeof password !== 'string' || password.trim().length === 0) {
+    return res.status(401).json({ error: 'Password is required and must be a non-empty string' });
+  }
+
+  // 2. Reject missing identity; require explicit userId or email.
+  const lookupId = typeof userId === 'string' && userId.trim() ? userId.trim() : null;
+  const lookupEmail = typeof email === 'string' && email.trim() ? email.trim().toLowerCase() : null;
+
+  if (!lookupId && !lookupEmail) {
+    return res.status(401).json({ error: 'A valid userId or email is required' });
+  }
+
+  const accountKey = lookupEmail || lookupId || '';
+
+  const accRecord = loginFailuresByAccount.get(accountKey);
+  if (accRecord && accRecord.lockedUntil > now) {
+    const retryAfterSec = Math.ceil((accRecord.lockedUntil - now) / 1000);
+    return res.status(429).json({ error: `Too many failed login attempts for this account. Please try again in ${retryAfterSec} seconds.` });
+  }
+
+  // 3. Find user account
+  const user = users.find(u => (lookupId && u.id === lookupId) || (lookupEmail && u.email && u.email.toLowerCase() === lookupEmail));
+  if (!user || typeof user.password !== 'string' || user.password.trim().length === 0) {
+    recordLoginFailure(clientIp, accountKey, now);
     return res.status(401).json({ error: 'Invalid credentials or user not found' });
   }
+
+  // 4. Secure timing-safe password comparison
+  const suppliedBuf = Buffer.from(password);
+  const storedBuf = Buffer.from(user.password);
+  const isMatch = suppliedBuf.length === storedBuf.length && timingSafeEqual(suppliedBuf, storedBuf);
+
+  if (!isMatch) {
+    recordLoginFailure(clientIp, accountKey, now);
+    return res.status(401).json({ error: 'Invalid credentials or user not found' });
+  }
+
+  // 5. Successful login: reset failure counters
+  loginFailuresByIP.delete(clientIp);
+  if (accountKey) {
+    loginFailuresByAccount.delete(accountKey);
+  }
+
+  // 6. Preserve existing signed-token architecture
   const token = signToken({ id: user.id, role: user.role, email: user.email });
-  res.json({
+  return res.json({
     success: true,
     token,
     user: {
@@ -131,11 +283,34 @@ function safeUser(user: any) {
 }
 
 function requireAuth(req: Request, res: Response, next: NextFunction) {
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7).trim();
+    if (ADMIN_TOKEN && ADMIN_TOKEN.length > 0 && token === ADMIN_TOKEN) {
+      (req as any).authenticatedUserId = 'user_admin';
+      return next();
+    }
+  }
+
   const userId = resolveAuthenticatedUserId(req);
   if (!userId) {
     return res.status(401).json({ error: 'Unauthorized: Authentication required' });
   }
+
+  const u = users.find(user => user.id === userId);
+  if (!u) {
+    return res.status(401).json({ error: 'Unauthorized: User account not found' });
+  }
+
+  if (u.status !== 'active') {
+    return res.status(403).json({
+      error: `Forbidden: Account is ${u.status}. Access denied.`,
+      status: u.status
+    });
+  }
+
   (req as any).authenticatedUserId = userId;
+  (req as any).authenticatedUser = u;
   next();
 }
 
@@ -159,36 +334,71 @@ function ALLOWED_ROLES_CHECK(role: string, allowed: string[]) {
 
 function requireRole(allowedRoles: string[]) {
   return (req: Request, res: Response, next: NextFunction) => {
-    if (req.headers.authorization) {
-      const header = String(req.headers.authorization);
-      const given = header.startsWith('Bearer ') ? header.slice(7) : '';
-      if (ADMIN_TOKEN && given === ADMIN_TOKEN) return next();
-      return res.status(401).json({ error: 'Invalid authentication token' });
+    // 1. Direct admin API token bypass
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.slice(7).trim();
+      if (ADMIN_TOKEN && ADMIN_TOKEN.length > 0 && token === ADMIN_TOKEN) {
+        return next();
+      }
     }
+
+    // 2. Verified JWT / Session authentication
     const userId = resolveAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized: Authentication required' });
+    }
+
     const u = users.find(user => user.id === userId);
-    if (!u) return res.status(401).json({ error: 'Authentication required' });
-    if (!ALLOWED_ROLES_CHECK(u.role, allowedRoles)) {
+    if (!u) {
+      return res.status(401).json({ error: 'Unauthorized: User account not found' });
+    }
+
+    if (u.status !== 'active') {
+      return res.status(403).json({ error: `Forbidden: Account is ${u.status}. Access denied.` });
+    }
+
+    const role = u.role;
+    if (!role || !ALLOWED_ROLES_CHECK(role, allowedRoles)) {
       return res.status(403).json({ error: `Forbidden: Insufficient privileges (required: ${allowedRoles.join(', ')})` });
     }
+    (req as any).authenticatedUserId = userId;
+    (req as any).authenticatedUser = u;
     next();
   };
 }
 
-// Admin guard. Set ADMIN_API_TOKEN in your environment; send it as "Authorization: Bearer <token>".
+// Admin guard: checks ADMIN_API_TOKEN or verified admin JWT session
 function requireAdmin(req: Request, res: Response, next: NextFunction) {
-  if (ADMIN_TOKEN) {
-    const header = String(req.headers.authorization || '');
-    const given = header.startsWith('Bearer ') ? header.slice(7) : '';
-    if (given && given === ADMIN_TOKEN) return next();
-    return res.status(401).json({ error: 'Invalid authentication token' });
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7).trim();
+    if (ADMIN_TOKEN && ADMIN_TOKEN.length > 0 && token === ADMIN_TOKEN) {
+      return next();
+    }
   }
+
   const userId = resolveAuthenticatedUserId(req);
+  if (!userId) {
+    return res.status(401).json({ error: 'Unauthorized: Authentication required' });
+  }
+
   const u = users.find(user => user.id === userId);
-  if (u && (u.role === 'admin' || u.role === 'super_admin')) {
+  if (!u) {
+    return res.status(401).json({ error: 'Unauthorized: User account not found' });
+  }
+
+  if (u.status !== 'active') {
+    return res.status(403).json({ error: `Forbidden: Admin account is ${u.status}` });
+  }
+
+  const role = u.role;
+  if (role === 'admin' || role === 'super_admin') {
+    (req as any).authenticatedUserId = userId;
+    (req as any).authenticatedUser = u;
     return next();
   }
-  return res.status(401).json({ error: 'Access denied' });
+  return res.status(403).json({ error: 'Forbidden: Admin access required' });
 }
 
 
@@ -230,6 +440,9 @@ app.use(['/api/payouts', '/api/refunds', '/api/audit-logs'], (req: Request, res:
 
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
+wss.on('error', (err) => {
+  console.error('WSS Server error:', err);
+});
 
 // Initialize Gemini AI client
 const ai = new GoogleGenAI({
@@ -257,7 +470,7 @@ interface User {
   completedJobs: number;
   bio: string;
   skills: string[];
-  status: 'active' | 'suspended' | 'restricted';
+  status: 'active' | 'suspended' | 'restricted' | 'deactivated';
   verified: boolean;
   walletBalance: number;
   createdAt: string;
@@ -447,7 +660,7 @@ interface UserEmail {
   userEmail: string;
   subject: string;
   body: string;
-  type: 'SUSPEND' | 'RESTRICT' | 'IMPERSONATE' | 'GENERAL';
+  type: 'SUSPEND' | 'RESTRICT' | 'DEACTIVATE' | 'IMPERSONATE' | 'GENERAL';
   sentAt: string;
   read: boolean;
 }
@@ -465,7 +678,7 @@ let userEmails: UserEmail[] = [
   }
 ];
 
-function notifyUserOnAdminAction(user: User, action: 'suspended' | 'restricted' | 'impersonated', notes?: string) {
+function notifyUserOnAdminAction(user: User, action: 'suspended' | 'restricted' | 'deactivated' | 'impersonated', notes?: string) {
   const timestamp = new Date().toLocaleString();
   const timeShort = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
@@ -481,6 +694,10 @@ function notifyUserOnAdminAction(user: User, action: 'suspended' | 'restricted' 
     emailSubject = `[NOTICE] WorkSphere Account Privileges Restricted`;
     emailBody = `Dear ${user.name},\n\nYour WorkSphere account (${user.email}) privileges have been RESTRICTED by Platform Administration.\n\nReason/Notes: ${notes || 'Account compliance review / policy warning'}.\n\nCertain actions (such as creating new gigs or submitting bids) are currently limited. Please contact our Support Desk to resolve these restrictions.`;
     chatText = `⚠️ ACCOUNT NOTICE: Your WorkSphere account privileges have been RESTRICTED by Platform Administration. Please Contact Support Desk for assistance and clarification.`;
+  } else if (action === 'deactivated') {
+    emailSubject = `[NOTICE] WorkSphere Account Deactivated`;
+    emailBody = `Dear ${user.name},\n\nYour WorkSphere account (${user.email}) has been DEACTIVATED by Platform Administration.\n\nReason/Notes: ${notes || 'Account deactivated'}.`;
+    chatText = `🚨 ACCOUNT ALERT: Your WorkSphere account has been DEACTIVATED.`;
   } else if (action === 'impersonated') {
     emailSubject = `[SECURITY NOTICE] Administrative Support Session Initialized`;
     emailBody = `Dear ${user.name},\n\nA Super Administrator initialized an Administrative Support Impersonation Session for your account (${user.email}) at ${timestamp} for support investigation and auditing.\n\nIf you have any questions or security concerns, please contact support immediately.`;
@@ -494,7 +711,7 @@ function notifyUserOnAdminAction(user: User, action: 'suspended' | 'restricted' 
     userEmail: user.email,
     subject: emailSubject,
     body: emailBody,
-    type: action === 'suspended' ? 'SUSPEND' : action === 'restricted' ? 'RESTRICT' : 'IMPERSONATE',
+    type: action === 'suspended' ? 'SUSPEND' : action === 'restricted' ? 'RESTRICT' : action === 'deactivated' ? 'DEACTIVATE' : 'IMPERSONATE',
     sentAt: timestamp,
     read: false
   };
@@ -537,6 +754,10 @@ function notifyUser(message: Message, targetUserId: string) {
   }
 }
 
+// Development / Testing credentials - strictly isolated from production deployment
+const DEV_DEMO_PASSWORD = 'password123';
+const DEV_ADMIN_PASSWORD = 'adminpassword123';
+
 // Initial Data Seeds
 let users: User[] = [
   {
@@ -557,7 +778,7 @@ let users: User[] = [
     verified: true,
     walletBalance: 4250,
     createdAt: '2025-01-15',
-    password: IS_PROD ? randomUUID() : 'password123'
+    password: IS_PROD ? undefined : DEV_DEMO_PASSWORD
   },
   {
     id: 'user_2',
@@ -577,7 +798,7 @@ let users: User[] = [
     verified: true,
     walletBalance: 12000,
     createdAt: '2025-02-01',
-    password: IS_PROD ? randomUUID() : 'password123'
+    password: IS_PROD ? undefined : DEV_DEMO_PASSWORD
   },
   {
     id: 'user_admin',
@@ -597,7 +818,7 @@ let users: User[] = [
     verified: true,
     walletBalance: 0,
     createdAt: '2025-01-01',
-    password: IS_PROD ? randomUUID() : 'adminpassword123'
+    password: IS_PROD ? (process.env.ADMIN_PASSWORD || undefined) : DEV_ADMIN_PASSWORD
   },
   {
     id: 'user_bk',
@@ -617,7 +838,8 @@ let users: User[] = [
     status: 'active',
     verified: true,
     walletBalance: 3450,
-    createdAt: '2025-01-10'
+    createdAt: '2025-01-10',
+    password: IS_PROD ? undefined : DEV_DEMO_PASSWORD
   },
   {
     id: 'user_3',
@@ -637,7 +859,8 @@ let users: User[] = [
     status: 'active',
     verified: true,
     walletBalance: 1850,
-    createdAt: '2025-02-15'
+    createdAt: '2025-02-15',
+    password: IS_PROD ? undefined : DEV_DEMO_PASSWORD
   }
 ];
 
@@ -1459,8 +1682,96 @@ function splitOrderFunds(order: Order, refundAmount: number, actor: string, reas
 app.get('/api/users', requireRole(['admin', 'super_admin']), (req, res) => {
   res.json(users.map(safeUser));
 });
-app.get('/api/gigs', (req, res) => res.json(gigs));
-app.get('/api/projects', (req, res) => res.json(projects));
+function sanitizePublicGig(g: Gig): Omit<Gig, 'moderationStatus' | 'moderationNotes'> {
+  const { moderationStatus, moderationNotes, ...publicGig } = g;
+  return publicGig;
+}
+
+function sanitizePublicProject(p: Project): Omit<Project, 'moderationStatus' | 'moderationNotes'> {
+  const { moderationStatus, moderationNotes, ...publicProj } = p;
+  return publicProj;
+}
+
+function isGigPublic(g: Gig): boolean {
+  if (g.status !== 'published') return false;
+  if (g.moderationStatus && g.moderationStatus !== 'approved') return false;
+  const author = users.find(u => u.id === g.freelancerId);
+  if (author && author.status !== 'active') return false;
+  return true;
+}
+
+function isProjectPublic(p: Project): boolean {
+  if (p.status !== 'open' && p.status !== 'published') return false;
+  if (p.moderationStatus && p.moderationStatus !== 'approved') return false;
+  const author = users.find(u => u.id === p.buyerId);
+  if (author && author.status !== 'active') return false;
+  return true;
+}
+
+// Public Marketplace Endpoints: returns only published, active, approved listings without internal moderation/private metadata
+app.get('/api/gigs', (req, res) => {
+  const publicGigs = gigs.filter(isGigPublic).map(sanitizePublicGig);
+  res.json(publicGigs);
+});
+
+app.get('/api/projects', (req, res) => {
+  const publicProjects = projects.filter(isProjectPublic).map(sanitizePublicProject);
+  res.json(publicProjects);
+});
+
+// Single Listing Detail: public users receive only public sanitized listings; owners/admins may receive full listing
+app.get('/api/gigs/:id', (req, res) => {
+  const gig = gigs.find(g => g.id === req.params.id);
+  if (!gig) return res.status(404).json({ error: 'Gig not found' });
+
+  const authUserId = resolveAuthenticatedUserId(req);
+  const caller = authUserId ? users.find(u => u.id === authUserId) : null;
+  const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin';
+  const isOwner = authUserId && gig.freelancerId === authUserId;
+
+  if (isGigPublic(gig)) {
+    if (isAdmin || isOwner) return res.json(gig);
+    return res.json(sanitizePublicGig(gig));
+  }
+
+  if (isAdmin || isOwner) {
+    return res.json(gig);
+  }
+  return res.status(404).json({ error: 'Gig not found or unavailable' });
+});
+
+app.get('/api/projects/:id', (req, res) => {
+  const project = projects.find(p => p.id === req.params.id);
+  if (!project) return res.status(404).json({ error: 'Project not found' });
+
+  const authUserId = resolveAuthenticatedUserId(req);
+  const caller = authUserId ? users.find(u => u.id === authUserId) : null;
+  const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin';
+  const isOwner = authUserId && project.buyerId === authUserId;
+
+  if (isProjectPublic(project)) {
+    if (isAdmin || isOwner) return res.json(project);
+    return res.json(sanitizePublicProject(project));
+  }
+
+  if (isAdmin || isOwner) {
+    return res.json(project);
+  }
+  return res.status(404).json({ error: 'Project not found or unavailable' });
+});
+
+// Authenticated Owner Listings
+app.get('/api/my/gigs', requireAuth, (req, res) => {
+  const authUserId = (req as any).authenticatedUserId;
+  const myGigs = gigs.filter(g => g.freelancerId === authUserId);
+  res.json(myGigs);
+});
+
+app.get('/api/my/projects', requireAuth, (req, res) => {
+  const authUserId = (req as any).authenticatedUserId;
+  const myProjects = projects.filter(p => p.buyerId === authUserId);
+  res.json(myProjects);
+});
 app.get('/api/proposals', requireAuth, (req, res) => {
   const authUserId = (req as any).authenticatedUserId;
   const caller = users.find(u => u.id === authUserId);
@@ -1564,6 +1875,12 @@ app.post('/api/orders/:id/deliverable', requireAuth, (req, res) => {
     return res.status(403).json({ error: 'Unauthorized: Only seller can upload deliverables.' });
   }
 
+  // Only permit delivery submission from valid active states
+  const allowedStatuses = ['funded_in_escrow', 'in_progress', 'revision'];
+  if (!allowedStatuses.includes(order.status)) {
+    return res.status(409).json({ error: `Cannot submit a deliverable for an order in "${order.status}" status.` });
+  }
+
   if (!order.deliverableFiles) order.deliverableFiles = [];
   const newFile = {
     id: 'deliv_' + Date.now(),
@@ -1574,9 +1891,7 @@ app.post('/api/orders/:id/deliverable', requireAuth, (req, res) => {
   };
 
   order.deliverableFiles.push(newFile);
-  if (order.status !== 'completed' && order.status !== 'disputed') {
-    order.status = 'delivered';
-  }
+  order.status = 'delivered';
 
   const sysMsg: Message = {
     id: 'msg_' + Date.now(),
@@ -1664,11 +1979,17 @@ app.post('/api/users/:id/flag', requireAdmin, (req, res) => {
   res.json({ success: true, isFlagged: user.isFlagged, flagReason: user.flagReason, user });
 });
 
-// Force Complete & Release Funds (admin)
-app.post('/api/orders/:id/force-complete', (req, res) => {
+// Force Complete & Release Funds (admin only)
+app.post('/api/orders/:id/force-complete', requireAdmin, (req, res) => {
   try {
     const order = orders.find(o => o.id === req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.status === 'completed') {
+      return res.status(400).json({ error: 'Order is already completed; funds were already released.' });
+    }
+    if (order.status === 'cancelled') {
+      return res.status(400).json({ error: 'Cannot force-complete a cancelled/refunded order.' });
+    }
     const reason = String(req.body.reason || 'Admin administrative force-release in seller favor.');
     const result = releaseOrderFunds(order, adminActor(req), reason, req.body.requestKey);
     closeActiveDispute(order.id, 'resolved_release', reason);
@@ -1679,11 +2000,17 @@ app.post('/api/orders/:id/force-complete', (req, res) => {
   }
 });
 
-// Force Cancel & Refund Buyer (admin). A partial refund refunds that amount and releases the rest to the seller.
-app.post('/api/orders/:id/force-cancel', (req, res) => {
+// Force Cancel & Refund Buyer (admin only). A partial refund refunds that amount and releases the rest to the seller.
+app.post('/api/orders/:id/force-cancel', requireAdmin, (req, res) => {
   try {
     const order = orders.find(o => o.id === req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.status === 'completed') {
+      return res.status(400).json({ error: 'Cannot force-cancel an already completed order.' });
+    }
+    if (order.status === 'cancelled') {
+      return res.status(400).json({ error: 'Order is already cancelled/refunded.' });
+    }
     const reason = String(req.body.reason || 'Admin cancelled order and refunded buyer wallet');
     const isPartial = req.body.refundType === 'partial';
     let result: any;
@@ -2021,12 +2348,37 @@ function handlePayoutRequest(req: Request, res: Response) {
 }
 
 // Deposit Funds into User Account (Simulated - Strictly Development Only)
-app.post('/api/payments/deposit', rateLimit(10, 60_000), (req, res) => {
+app.post('/api/payments/deposit', requireAuth, rateLimit(10, 60_000), (req, res) => {
   try {
-    if (IS_PROD && process.env.ALLOW_SIMULATED_DEPOSITS !== 'true') {
+    // Simulated deposits are strictly development/test functionality; reject in production unconditionally
+    if (!areSimulatedDepositsAllowed()) {
       return res.status(501).json({ error: 'Deposits require a connected payment gateway in production.' });
     }
-    const userId = String(req.body?.userId || '');
+
+    const authUserId = (req as any).authenticatedUserId;
+    if (!authUserId) {
+      return res.status(401).json({ error: 'Unauthorized: Authentication required' });
+    }
+
+    const caller = users.find(u => u.id === authUserId);
+    if (!caller) {
+      return res.status(401).json({ error: 'Authenticated user not found' });
+    }
+
+    // User A cannot credit User B's wallet by supplying User B's ID
+    const requestedUserId = req.body?.userId;
+    let targetUserId = authUserId;
+    if (requestedUserId && requestedUserId !== authUserId) {
+      const isAdmin = caller.role === 'admin' || caller.role === 'super_admin';
+      if (!isAdmin) {
+        return res.status(403).json({ error: 'Forbidden: You cannot deposit funds into another user wallet.' });
+      }
+      const targetUser = users.find(u => u.id === requestedUserId);
+      if (!targetUser) {
+        return res.status(404).json({ error: 'Target user not found' });
+      }
+      targetUserId = requestedUserId;
+    }
     const amount = Number(req.body?.amount);
     if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ error: 'Please enter a valid deposit amount greater than $0.00' });
@@ -2035,29 +2387,26 @@ app.post('/api/payments/deposit', rateLimit(10, 60_000), (req, res) => {
       return res.status(400).json({ error: 'Simulated deposits are limited to $5,000.' });
     }
 
-    const u = users.find(user => user.id === userId);
-    if (!u) return res.status(404).json({ error: 'User not found' });
-
-    ensureWallet(u.id);
+    ensureWallet(targetUserId);
     const key = String(req.body?.idempotencyKey || req.body?.providerReference || randomUUID());
     const result = financeLedger.creditDeposit({
-      userId: u.id,
+      userId: targetUserId,
       amount,
       reference: `SIM-${key}`,
-      idempotencyKey: `SIM-${u.id}-${key}`,
-      actor: 'Simulated Gateway',
+      idempotencyKey: `SIM-${targetUserId}-${key}`,
+      actor: `${caller.name} (Simulated)`,
       source: 'simulated'
     });
     syncUserBalances();
-    const newBalance = financeLedger.getWalletBalance(u.id) ?? u.walletBalance;
+    const newBalance = financeLedger.getWalletBalance(targetUserId) ?? caller.walletBalance;
     const transaction = financeLedger.getTransactions().find(t => t.journalId === result.journal.id);
 
     auditLogs.unshift({
       id: 'log_' + Date.now(),
-      actor: u.name,
-      role: u.role,
+      actor: caller.name,
+      role: caller.role,
       action: 'FUNDS_DEPOSITED',
-      target: `User ${u.name}`,
+      target: `User ${caller.name}`,
       details: `Deposited $${amount.toFixed(2)} (simulated). New Balance: $${newBalance.toFixed(2)}`,
       timestamp: new Date().toLocaleString()
     });
@@ -2069,7 +2418,7 @@ app.post('/api/payments/deposit', rateLimit(10, 60_000), (req, res) => {
 });
 
 // Withdraw Funds from User Account
-app.post('/api/payments/withdraw', rateLimit(10, 60_000), handlePayoutRequest);
+app.post('/api/payments/withdraw', requireAuth, rateLimit(10, 60_000), handlePayoutRequest);
 
 // Release Escrow Payment (Buyer approves work)
 app.post('/api/payments/escrow/release', requireAuth, (req, res) => {
@@ -2088,6 +2437,24 @@ app.post('/api/payments/escrow/release', requireAuth, (req, res) => {
     if (order.status === 'completed') {
       return res.status(400).json({ error: 'Order escrow has already been released and completed.' });
     }
+    if (order.status === 'cancelled') {
+      return res.status(400).json({ error: 'Cannot release escrow: Order has already been cancelled/refunded.' });
+    }
+
+    const activeDispute = disputes.find(d => d.orderId === order.id && (d.status === 'open' || d.status === 'under_investigation'));
+    if (activeDispute || order.status === 'disputed') {
+      return res.status(400).json({ error: 'Cannot release escrow: Order is under active dispute. Resolve the dispute first.' });
+    }
+
+    const releasableStatuses = ['delivered', 'in_progress', 'revision', 'funded_in_escrow'];
+    if (!releasableStatuses.includes(order.status)) {
+      return res.status(400).json({ error: `Cannot release escrow for order in "${order.status}" status.` });
+    }
+
+    const esc = financeLedger.getEscrow(order.id);
+    if (!esc || esc.remaining <= 0 || esc.status === 'released' || esc.status === 'refunded') {
+      return res.status(400).json({ error: 'No refundable or releasable escrow funds remain for this order.' });
+    }
 
     const seller = users.find(u => u.id === order.sellerId);
     const buyer = users.find(u => u.id === order.buyerId);
@@ -2095,8 +2462,9 @@ app.post('/api/payments/escrow/release', requireAuth, (req, res) => {
     if (seller) ensureWallet(seller.id);
     if (buyer) ensureWallet(buyer.id);
 
-    const actorName = caller?.name || buyer?.name || 'Authorized Buyer';
-    const result = releaseOrderFunds(order, actorName, 'Buyer approved work');
+    const actorName = isAdmin ? adminActor(req) : (buyer?.name || 'Authorized Buyer');
+    const requestKey = req.body?.requestKey || req.body?.idempotencyKey;
+    const result = releaseOrderFunds(order, actorName, 'Buyer approved work', requestKey);
 
     auditLogs.unshift({
       id: 'log_' + Date.now(),
@@ -2114,7 +2482,7 @@ app.post('/api/payments/escrow/release', requireAuth, (req, res) => {
   }
 });
 
-// Refund Escrow Payment (Buyer or Admin refund)
+// Refund Escrow Payment
 app.post('/api/payments/escrow/refund', requireAuth, (req, res) => {
   try {
     const userId = (req as any).authenticatedUserId;
@@ -2124,27 +2492,56 @@ app.post('/api/payments/escrow/refund', requireAuth, (req, res) => {
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
     const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin';
-    if (!isAdmin && userId !== order.buyerId && userId !== order.sellerId) {
-      return res.status(403).json({ error: 'Unauthorized: Only order participants or administrators can refund escrow.' });
+    const isBuyer = userId === order.buyerId;
+    const isSeller = userId === order.sellerId;
+
+    if (!isAdmin && !isBuyer && !isSeller) {
+      return res.status(403).json({ error: 'Unauthorized: Only order participants or administrators can access escrow refund.' });
     }
 
+    if (order.status === 'completed') {
+      return res.status(400).json({ error: 'Cannot refund order: Escrow funds have already been released to seller.' });
+    }
     if (order.status === 'cancelled') {
       return res.status(400).json({ error: 'Order is already cancelled/refunded.' });
     }
 
+    const activeDispute = disputes.find(d => d.orderId === order.id && (d.status === 'open' || d.status === 'under_investigation'));
+    if (activeDispute || order.status === 'disputed') {
+      return res.status(400).json({ error: 'Cannot refund order: Order is under active dispute. It must be resolved through dispute resolution.' });
+    }
+
+    const esc = financeLedger.getEscrow(order.id);
+    if (!esc || esc.remaining <= 0 || esc.status === 'released' || esc.status === 'refunded') {
+      return res.status(400).json({ error: 'No refundable escrow funds remaining for this order.' });
+    }
+
+    // Role-specific financial state rules:
+    // A buyer CANNOT unilaterally refund if work has been delivered or is active in progress
+    if (isBuyer && !isAdmin) {
+      if (order.status === 'delivered' || (order.deliverableFiles && order.deliverableFiles.length > 0)) {
+        return res.status(403).json({ error: 'Cannot unilaterally refund a delivered order. If work is unsatisfactory, please request a revision or file a dispute.' });
+      }
+      if (order.status === 'in_progress' || order.status === 'revision') {
+        return res.status(403).json({ error: 'Cannot unilaterally refund an active order in progress. The seller must initiate cancellation or a dispute must be filed.' });
+      }
+    }
+
+    // Beneficiary is ALWAYS the order's buyer from server order record (never client-supplied)
     const buyer = users.find(u => u.id === order.buyerId);
     if (buyer) ensureWallet(buyer.id);
 
-    const actorName = caller?.name || buyer?.name || 'Buyer';
-    const result = refundOrderFunds(order, undefined, actorName, reason || 'Escrow cancellation');
+    const actorName = isAdmin ? adminActor(req) : (caller?.name || (isSeller ? 'Seller' : 'Buyer'));
+    const requestKey = req.body?.requestKey || req.body?.idempotencyKey;
+    const result = refundOrderFunds(order, undefined, actorName, reason || (isSeller ? 'Seller cancelled order' : 'Escrow cancellation'), requestKey);
 
     auditLogs.unshift({
       id: 'log_' + Date.now(),
       actor: actorName,
-      role: caller?.role || 'buyer',
-      action: 'ESCROW_REFUNDED_BY_BUYER',
+      role: caller?.role || (isSeller ? 'seller' : 'buyer'),
+      action: isSeller ? 'ESCROW_REFUNDED_BY_SELLER' : (isAdmin ? 'ESCROW_REFUNDED_BY_ADMIN' : 'ESCROW_REFUNDED_BY_BUYER'),
       target: `Order #${order.id}`,
-      details: `Escrow refund requested of $${result.refunded} to wallet. Reason: ${reason || 'Escrow cancellation'}`,
+      details: `Escrow refund executed of $${result.refunded} to buyer wallet. Reason: ${reason || 'Escrow cancellation'}`,
       timestamp: new Date().toLocaleString()
     });
 
@@ -2591,9 +2988,19 @@ app.post('/api/admin/finance/escrow/:orderId/release', (req, res) => {
   try {
     const order = orders.find(o => o.id === req.params.orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.status === 'completed') {
+      return res.status(400).json({ error: 'Order escrow has already been released and completed.' });
+    }
+    if (order.status === 'cancelled') {
+      return res.status(400).json({ error: 'Cannot release escrow: Order has already been cancelled/refunded.' });
+    }
     const activeDispute = disputes.find(d => d.orderId === order.id && (d.status === 'open' || d.status === 'under_investigation'));
-    if (activeDispute) {
-      return res.status(400).json({ error: `Cannot release escrow: Order #${order.id} is under active dispute (${activeDispute.id}). Resolve the dispute first.` });
+    if (activeDispute || order.status === 'disputed') {
+      return res.status(400).json({ error: `Cannot release escrow: Order #${order.id} is under active dispute. Resolve the dispute first.` });
+    }
+    const esc = financeLedger.getEscrow(order.id);
+    if (!esc || esc.remaining <= 0 || esc.status === 'released' || esc.status === 'refunded') {
+      return res.status(400).json({ error: 'No refundable or releasable escrow funds remain for this order.' });
     }
     const result = releaseOrderFunds(order, adminActor(req), String(req.body.reason || 'Administrative escrow release'), req.body.requestKey);
     res.json({ success: true, order, journal: result.journal, freelancerNet: result.freelancerNet, platformFee: result.platformFee });
@@ -2606,6 +3013,16 @@ app.post('/api/admin/finance/escrow/:orderId/refund', (req, res) => {
   try {
     const order = orders.find(o => o.id === req.params.orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.status === 'completed') {
+      return res.status(400).json({ error: 'Cannot refund order: Escrow funds have already been released to seller.' });
+    }
+    if (order.status === 'cancelled') {
+      return res.status(400).json({ error: 'Order is already cancelled/refunded.' });
+    }
+    const esc = financeLedger.getEscrow(order.id);
+    if (!esc || esc.remaining <= 0 || esc.status === 'released' || esc.status === 'refunded') {
+      return res.status(400).json({ error: 'No refundable escrow funds remaining for this order.' });
+    }
     const amount = req.body.amount === undefined || req.body.amount === '' ? undefined : Number(req.body.amount);
     const result = refundOrderFunds(order, amount, adminActor(req), String(req.body.reason || 'Administrative escrow refund approval'), req.body.requestKey);
     closeActiveDispute(order.id, 'resolved_refund', String(req.body.reason || 'Administrative escrow refund'));
@@ -2725,25 +3142,63 @@ app.patch('/api/admin/payouts/:id/process', processPayout);
 app.patch('/api/admin/payouts/:id/fail', failPayout);
 
 // Freelancer withdrawal request: uses isolated payout user authorization and ledger requestPayout
-app.post('/api/payouts', rateLimit(10, 60_000), handlePayoutRequest);
+app.post('/api/payouts', requireAuth, rateLimit(10, 60_000), handlePayoutRequest);
 
-// Wallet top-up. Simulated until a payment gateway is connected: when you add Stripe/Razorpay, delete this
-// route and call financeLedger.creditDeposit() from the verified webhook handler using the gateway's event id as idempotencyKey.
-app.post('/api/wallet/deposit', rateLimit(10, 60_000), (req, res) => {
+// Wallet top-up (Simulated - Strictly Development Only)
+app.post('/api/wallet/deposit', requireAuth, rateLimit(10, 60_000), (req, res) => {
   try {
-    if (IS_PROD && process.env.ALLOW_SIMULATED_DEPOSITS !== 'true') {
-      return res.status(501).json({ error: 'Deposits require a connected payment gateway.' });
+    // Simulated deposits are strictly development/test functionality; reject in production unconditionally
+    if (!areSimulatedDepositsAllowed()) {
+      return res.status(501).json({ error: 'Deposits require a connected payment gateway in production.' });
     }
-    const userId = String(req.body?.userId || '');
+
+    const authUserId = (req as any).authenticatedUserId;
+    if (!authUserId) {
+      return res.status(401).json({ error: 'Unauthorized: Authentication required' });
+    }
+
+    const caller = users.find(u => u.id === authUserId);
+    if (!caller) {
+      return res.status(401).json({ error: 'Authenticated user not found' });
+    }
+
+    // User A cannot credit User B's wallet by supplying User B's ID
+    const requestedUserId = req.body?.userId;
+    let targetUserId = authUserId;
+    if (requestedUserId && requestedUserId !== authUserId) {
+      const isAdmin = caller.role === 'admin' || caller.role === 'super_admin';
+      if (!isAdmin) {
+        return res.status(403).json({ error: 'Forbidden: You cannot deposit funds into another user wallet.' });
+      }
+      const targetUser = users.find(u => u.id === requestedUserId);
+      if (!targetUser) {
+        return res.status(404).json({ error: 'Target user not found' });
+      }
+      targetUserId = requestedUserId;
+    }
     const amount = Number(req.body?.amount);
-    if (!users.some(u => u.id === userId)) return res.status(404).json({ error: 'User not found' });
-    ensureWallet(userId);
-    if (Number.isFinite(amount) && amount > 5000) return res.status(400).json({ error: 'Simulated deposits are limited to $5,000.' });
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'Please enter a valid deposit amount greater than $0.00' });
+    }
+    if (amount > 5000) {
+      return res.status(400).json({ error: 'Simulated deposits are limited to $5,000.' });
+    }
+
+    ensureWallet(targetUserId);
     const key = String(req.body?.idempotencyKey || randomUUID());
-    const { replayed } = financeLedger.creditDeposit({ userId, amount, reference: `SIM-${key}`, idempotencyKey: `SIM-${userId}-${key}`, actor: 'Simulated Gateway', source: 'simulated' });
+    const { replayed } = financeLedger.creditDeposit({
+      userId: targetUserId,
+      amount,
+      reference: `SIM-${key}`,
+      idempotencyKey: `SIM-${targetUserId}-${key}`,
+      actor: `${caller.name} (Simulated)`,
+      source: 'simulated'
+    });
     syncUserBalances();
-    res.json({ success: true, replayed, balance: financeLedger.getWalletBalance(userId) });
-  } catch (err: any) { res.status(400).json({ error: err.message }); }
+    res.json({ success: true, replayed, balance: financeLedger.getWalletBalance(targetUserId) });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 // 7. Reconciliation Workspace & Exception Resolution
@@ -3113,10 +3568,10 @@ app.get('/api/messages/:orderId', requireAuth, (req, res) => {
   res.json(filtered);
 });
 
-app.post('/api/messages', (req, res) => {
-  const authUserId = resolveUserId(req);
-  const caller = users.find(u => u.id === authUserId);
-  if (!caller) return res.status(401).json({ error: 'Authentication required' });
+app.post('/api/messages', requireAuth, (req, res) => {
+  const authUserId = (req as any).authenticatedUserId;
+  const caller = (req as any).authenticatedUser || users.find(u => u.id === authUserId);
+  if (!caller || caller.status !== 'active') return res.status(403).json({ error: 'Account is not active' });
   const orderId = req.body.orderId;
   const order = orders.find(o => o.id === orderId);
   if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -3133,13 +3588,14 @@ app.post('/api/messages', (req, res) => {
     timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   };
   messages.push(newMsg);
+  broadcastMessage(newMsg, order.id);
   res.json(newMsg);
 });
 
-app.post('/api/gigs', (req, res) => {
-  const authUserId = resolveUserId(req);
-  const caller = users.find(u => u.id === authUserId);
-  if (!caller) return res.status(401).json({ error: 'Authentication required' });
+app.post('/api/gigs', requireAuth, (req, res) => {
+  const authUserId = (req as any).authenticatedUserId;
+  const caller = (req as any).authenticatedUser || users.find(u => u.id === authUserId);
+  if (!caller || caller.status !== 'active') return res.status(403).json({ error: 'Account is not active' });
   const newGig: Gig = {
     id: 'gig_' + Date.now(),
     freelancerId: caller.id,
@@ -3165,10 +3621,10 @@ app.post('/api/gigs', (req, res) => {
   res.json(newGig);
 });
 
-app.post('/api/projects', (req, res) => {
-  const authUserId = resolveUserId(req);
-  const caller = users.find(u => u.id === authUserId);
-  if (!caller) return res.status(401).json({ error: 'Authentication required' });
+app.post('/api/projects', requireAuth, (req, res) => {
+  const authUserId = (req as any).authenticatedUserId;
+  const caller = (req as any).authenticatedUser || users.find(u => u.id === authUserId);
+  if (!caller || caller.status !== 'active') return res.status(403).json({ error: 'Account is not active' });
   const newProj: Project = {
     id: 'proj_' + Date.now(),
     buyerId: caller.id,
@@ -3191,6 +3647,10 @@ app.post('/api/projects', (req, res) => {
 });
 
 // Admin Projects Management Endpoints
+app.get('/api/admin/projects', (req, res) => {
+  res.json(projects);
+});
+
 app.patch('/api/admin/projects/:id', (req, res) => {
   const p = projects.find(proj => proj.id === req.params.id);
   if (!p) return res.status(404).json({ error: 'Project not found' });
@@ -3280,6 +3740,10 @@ app.delete('/api/admin/projects/:id', (req, res) => {
 });
 
 // Admin Gigs / Services Management Endpoints
+app.get('/api/admin/gigs', (req, res) => {
+  res.json(gigs);
+});
+
 app.patch('/api/admin/gigs/:id', (req, res) => {
   const g = gigs.find(gig => gig.id === req.params.id);
   if (!g) return res.status(404).json({ error: 'Gig/Service not found' });
@@ -3367,10 +3831,10 @@ app.delete('/api/admin/gigs/:id', (req, res) => {
   res.json({ success: true, id: deleted.id });
 });
 
-app.post('/api/proposals', (req, res) => {
-  const authUserId = resolveUserId(req);
-  const caller = users.find(u => u.id === authUserId);
-  if (!caller) return res.status(401).json({ error: 'Authentication required' });
+app.post('/api/proposals', requireAuth, (req, res) => {
+  const authUserId = (req as any).authenticatedUserId;
+  const caller = (req as any).authenticatedUser || users.find(u => u.id === authUserId);
+  if (!caller || caller.status !== 'active') return res.status(403).json({ error: 'Account is not active' });
   const newProp: Proposal = {
     id: 'prop_' + Date.now(),
     projectId: req.body.projectId,
@@ -3390,11 +3854,11 @@ app.post('/api/proposals', (req, res) => {
   res.json(newProp);
 });
 
-app.post('/api/orders', rateLimit(30, 60_000), (req, res) => {
+app.post('/api/orders', requireAuth, rateLimit(30, 60_000), (req, res) => {
   try {
-    const authUserId = resolveUserId(req);
-    const caller = users.find(u => u.id === authUserId);
-    if (!caller) return res.status(401).json({ error: 'Authentication required' });
+    const authUserId = (req as any).authenticatedUserId;
+    const caller = (req as any).authenticatedUser || users.find(u => u.id === authUserId);
+    if (!caller || caller.status !== 'active') return res.status(403).json({ error: 'Account is not active' });
 
     const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
     if (title.length < 3) return res.status(400).json({ error: 'A valid order title is required.' });
@@ -3551,8 +4015,17 @@ app.patch('/api/admin/users/:id/status', (req, res) => {
     timestamp: new Date().toLocaleString()
   });
 
-  // Notify user via chat message and email notification if suspended or restricted
-  if (req.body.status === 'suspended' || req.body.status === 'restricted') {
+  // Disconnect any active WebSocket connections if account is suspended, restricted, or deactivated
+  if (u.status !== 'active') {
+    for (const client of clients) {
+      if ((client as any).authenticatedUserId === u.id) {
+        client.close(1008, `Account is ${u.status}`);
+      }
+    }
+  }
+
+  // Notify user via chat message and email notification if suspended, restricted, or deactivated
+  if (req.body.status === 'suspended' || req.body.status === 'restricted' || req.body.status === 'deactivated') {
     notifyUserOnAdminAction(u, req.body.status, req.body.notes);
   }
 
@@ -3641,6 +4114,13 @@ app.delete('/api/admin/users/:id', (req, res) => {
     details: `Permanently deleted user account ${deletedUser.email} and cleared their associated gigs & projects`,
     timestamp: new Date().toLocaleString()
   });
+
+  // Clean up any active WebSocket connections for deleted user
+  for (const client of clients) {
+    if ((client as any).authenticatedUserId === req.params.id) {
+      client.close(1008, 'Account deleted');
+    }
+  }
 
   res.json({ success: true, id: deletedUser.id });
 });
@@ -3749,6 +4229,10 @@ function broadcastMessage(message: Message, orderId: string) {
     const clientUserId = (client as any).authenticatedUserId;
     if (clientUserId) {
       const clientUser = users.find(u => u.id === clientUserId);
+      if (!clientUser || clientUser.status !== 'active') {
+        client.close(1008, 'Account is not active');
+        continue;
+      }
       const isAuthorized = clientUser && (
         ['admin', 'super_admin', 'support'].includes(clientUser.role) ||
         clientUserId === order.buyerId ||
@@ -3765,48 +4249,162 @@ function broadcastMessage(message: Message, orderId: string) {
 const clients = new Set<WebSocket>();
 
 wss.on('connection', (ws, req) => {
-  const url = new URL(req.url!, `http://${req.headers.host}`);
-  const token = url.searchParams.get('token');
-  
-  if (!token) {
-    ws.close(1008, 'Authentication token required');
-    return;
-  }
-  
-  const payload = verifyToken(token);
-  if (!payload) {
-    ws.close(1008, 'Invalid authentication token');
-    return;
-  }
-  
-  (ws as any).authenticatedUserId = payload.id;
-
-  clients.add(ws);
-
-  ws.on('message', (data) => {
+  try {
+    if (!req.url) {
+      ws.close(1008, 'Invalid connection URL');
+      return;
+    }
+    const host = req.headers.host || 'localhost';
+    let url: URL;
     try {
-      const parsed = JSON.parse(data.toString());
+      url = new URL(req.url, `http://${host}`);
+    } catch {
+      ws.close(1008, 'Malformed URL');
+      return;
+    }
+
+    const token = url.searchParams.get('token');
+    if (!token || typeof token !== 'string' || !token.trim()) {
+      ws.close(1008, 'Authentication token required');
+      return;
+    }
+
+    if (ADMIN_TOKEN && ADMIN_TOKEN.length > 0 && token === ADMIN_TOKEN) {
+      (ws as any).authenticatedUserId = 'user_admin';
+      clients.add(ws);
+      setupWebSocketHandlers(ws);
+      return;
+    }
+    
+    const payload = verifyToken(token);
+    if (!payload || !payload.id) {
+      ws.close(1008, 'Invalid authentication token');
+      return;
+    }
+
+    // Authoritative server-side status check: do not trust stale claims in token
+    const user = users.find(u => u.id === payload.id);
+    if (!user) {
+      ws.close(1008, 'User not found');
+      return;
+    }
+
+    if (user.status !== 'active') {
+      ws.close(1008, `Account is ${user.status}`);
+      return;
+    }
+    
+    (ws as any).authenticatedUserId = user.id;
+    clients.add(ws);
+    setupWebSocketHandlers(ws);
+  } catch (err) {
+    console.error('WS Connection error:', err);
+    try { ws.close(1011, 'Server error during connection'); } catch {}
+  }
+});
+
+function setupWebSocketHandlers(ws: WebSocket) {
+  // Rate limiting map for this socket: max 10 messages per 10 seconds
+  let messageCount = 0;
+  let resetTime = Date.now() + 10000;
+
+  ws.on('message', (data, isBinary) => {
+    try {
+      if (isBinary) {
+        ws.send(JSON.stringify({ error: 'Binary messages not supported' }));
+        return;
+      }
+
+      const rawStr = data.toString();
+      // Enforce maximum payload size (e.g. 10KB)
+      if (rawStr.length > 10240) {
+        ws.send(JSON.stringify({ error: 'Message payload exceeds maximum allowed size' }));
+        return;
+      }
+
+      // Rate limit check
+      const now = Date.now();
+      if (now > resetTime) {
+        messageCount = 1;
+        resetTime = now + 10000;
+      } else {
+        messageCount++;
+        if (messageCount > 10) {
+          ws.send(JSON.stringify({ error: 'Rate limit exceeded. Please slow down.' }));
+          return;
+        }
+      }
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(rawStr);
+      } catch {
+        ws.send(JSON.stringify({ error: 'Invalid JSON payload' }));
+        return;
+      }
+
+      if (!parsed || typeof parsed !== 'object') {
+        return;
+      }
+
       if (parsed.type === 'NEW_MESSAGE') {
         const userId = (ws as any).authenticatedUserId;
         if (!userId) {
-          console.error('WS: Unauthenticated message attempt');
+          ws.close(1008, 'Unauthenticated message attempt');
           return;
         }
 
         const user = users.find(u => u.id === userId);
-        const order = orders.find(o => o.id === parsed.orderId);
-        if (!order || !user) return;
+        if (!user || user.status !== 'active') {
+          ws.close(1008, 'Account is not active');
+          return;
+        }
 
-        // Authorization check
-        const isAuthorized = order.buyerId === userId || order.sellerId === userId || user.role === 'admin' || user.role === 'super_admin' || user.role === 'support';
-        if (!isAuthorized) return;
+        // Validate orderId format and existence
+        const orderId = parsed.orderId;
+        if (typeof orderId !== 'string' || !orderId.trim()) {
+          ws.send(JSON.stringify({ error: 'Valid orderId is required' }));
+          return;
+        }
 
+        const order = orders.find(o => o.id === orderId.trim());
+        if (!order) {
+          ws.send(JSON.stringify({ error: 'Order not found' }));
+          return;
+        }
+
+        // Muting check: muted users cannot message unless admin/support
+        const isAdminOrSupport = user.role === 'admin' || user.role === 'super_admin' || user.role === 'support';
+        if (order.isMuted && !isAdminOrSupport) {
+          ws.send(JSON.stringify({ error: 'Chat is currently muted by Administrator.' }));
+          return;
+        }
+
+        // Authorization check: only buyer, seller, or admin/support
+        const isAuthorized = order.buyerId === userId || order.sellerId === userId || isAdminOrSupport;
+        if (!isAuthorized) {
+          ws.send(JSON.stringify({ error: 'Unauthorized to send messages in this order' }));
+          return;
+        }
+
+        // Validate text content
+        const text = parsed.text;
+        if (typeof text !== 'string' || text.trim().length === 0) {
+          ws.send(JSON.stringify({ error: 'Message text cannot be empty' }));
+          return;
+        }
+        if (text.length > 2000) {
+          ws.send(JSON.stringify({ error: 'Message text is too long (max 2000 characters)' }));
+          return;
+        }
+
+        // Never trust client-supplied sender identity: use authenticated user
         const newMsg: Message = {
-          id: 'msg_' + Date.now(),
+          id: 'msg_' + Date.now() + Math.random().toString(36).substring(2, 5),
           orderId: order.id,
           senderId: user.id,
           senderName: user.name,
-          text: parsed.text,
+          text: text.trim(),
           timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
         };
         messages.push(newMsg);
@@ -3814,14 +4412,14 @@ wss.on('connection', (ws, req) => {
         broadcastMessage(newMsg, order.id);
       }
     } catch (e) {
-      console.error('WS message error:', e);
+      console.error('WS message processing error:', e);
     }
   });
 
   ws.on('close', () => {
     clients.delete(ws);
   });
-});
+}
 
 // Vite middleware integration for development
 if (process.env.NODE_ENV !== 'production') {

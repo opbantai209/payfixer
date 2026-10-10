@@ -69822,22 +69822,39 @@ import_dotenv.default.config();
 var __dirname = path2.dirname(fileURLToPath(import.meta.url));
 var app = (0, import_express.default)();
 app.use(import_express.default.json({ limit: "100kb" }));
-var IS_PROD = process.env.NODE_ENV === "production";
-if (IS_PROD && !process.env.ADMIN_API_TOKEN) {
-  throw new Error("ADMIN_API_TOKEN must be set in production");
+var isCompiledProductionBundle = path2.basename(fileURLToPath(import.meta.url)).startsWith("server.js");
+var isNpmStart = process.env.npm_lifecycle_event === "start";
+var isExplicitProd = process.env.NODE_ENV === "production";
+var isTestEnv = process.env.NODE_ENV === "test";
+var IS_PROD = (isExplicitProd || isNpmStart || isCompiledProductionBundle) && !isTestEnv;
+if (IS_PROD) {
+  process.env.NODE_ENV = "production";
+  if (!process.env.JWT_SECRET || process.env.JWT_SECRET.trim().length < 16) {
+    throw new Error("FATAL: A persistent JWT_SECRET (minimum 16 characters) must be explicitly configured in production.");
+  }
+  if (!process.env.ADMIN_API_TOKEN || process.env.ADMIN_API_TOKEN.trim().length < 16) {
+    throw new Error("FATAL: A secure ADMIN_API_TOKEN (minimum 16 characters) must be explicitly configured in production.");
+  }
+  const KNOWN_DEMO_PASSWORDS = ["password123", "adminpassword123", "password", "admin", "12345678", "qwerty", "admin123"];
+  if (process.env.ADMIN_PASSWORD && KNOWN_DEMO_PASSWORDS.includes(process.env.ADMIN_PASSWORD.trim().toLowerCase())) {
+    throw new Error("FATAL: Production ADMIN_PASSWORD cannot be set to a known demo or default password.");
+  }
 }
+var JWT_SECRET = IS_PROD ? process.env.JWT_SECRET : process.env.JWT_SECRET || "dev-insecure-jwt-secret-local-only";
 var ADMIN_TOKEN = process.env.ADMIN_API_TOKEN || "";
 var REQUIRE_KYC_FOR_PAYOUTS = process.env.REQUIRE_KYC_FOR_PAYOUTS !== "false";
+function areSimulatedDepositsAllowed() {
+  if (IS_PROD || process.env.NODE_ENV === "production") {
+    return false;
+  }
+  return true;
+}
 financeLedger.configure({
   commissionPercent: DEFAULT_SITE_SETTINGS.commission.commissionPercent,
   minimumOrderAmount: DEFAULT_SITE_SETTINGS.commission.minimumOrderAmount,
   minimumWithdrawalAmount: DEFAULT_SITE_SETTINGS.wallets.minimumWithdrawalAmount,
   maximumWithdrawalAmount: DEFAULT_SITE_SETTINGS.wallets.maximumWithdrawalPerTransaction
 });
-if (process.env.NODE_ENV === "production" && !process.env.JWT_SECRET) {
-  throw new Error("JWT_SECRET must be set in production");
-}
-var JWT_SECRET = process.env.JWT_SECRET || randomUUID2() + randomUUID2();
 function signToken(payload, expiresInMs = 7 * 24 * 3600 * 1e3) {
   const data = JSON.stringify({ ...payload, exp: Date.now() + expiresInMs });
   const base64Data = Buffer.from(data).toString("base64url");
@@ -69868,13 +69885,23 @@ function verifyAuthTokenMiddleware(req, res, next) {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith("Bearer ")) {
     const token = authHeader.slice(7).trim();
-    if (token === ADMIN_TOKEN) {
+    if (ADMIN_TOKEN && ADMIN_TOKEN.length > 0 && token === ADMIN_TOKEN) {
       req.user = { id: "user_admin", role: "super_admin", email: "admin@workperhour.com" };
       return next();
     }
     const payload = verifyToken(token);
     if (payload) {
-      req.user = payload;
+      const dbUser = users.find((u) => u.id === payload.id);
+      if (dbUser) {
+        req.user = {
+          id: dbUser.id,
+          role: dbUser.role,
+          status: dbUser.status,
+          email: dbUser.email
+        };
+      } else {
+        req.user = payload;
+      }
     }
   }
   next();
@@ -69885,15 +69912,92 @@ function resolveAuthenticatedUserId(req) {
   if (authUser && typeof authUser === "string" && authUser.trim()) return authUser.trim();
   return null;
 }
-var resolveUserId = resolveAuthenticatedUserId;
+var loginFailuresByIP = /* @__PURE__ */ new Map();
+var loginFailuresByAccount = /* @__PURE__ */ new Map();
+var MAX_LOGIN_FAILURES = 5;
+var LOGIN_LOCKOUT_MS = process.env.NODE_ENV === "test" ? 2e3 : 3e4;
+function recordLoginFailure(ip, accountKey, now) {
+  let ipRec = loginFailuresByIP.get(ip);
+  if (!ipRec || ipRec.lockedUntil <= now) {
+    ipRec = { count: 1, lockedUntil: 0 };
+  } else {
+    ipRec.count++;
+  }
+  if (ipRec.count >= MAX_LOGIN_FAILURES) {
+    ipRec.lockedUntil = now + LOGIN_LOCKOUT_MS;
+  }
+  loginFailuresByIP.set(ip, ipRec);
+  if (accountKey) {
+    let accRec = loginFailuresByAccount.get(accountKey);
+    if (!accRec || accRec.lockedUntil <= now) {
+      accRec = { count: 1, lockedUntil: 0 };
+    } else {
+      accRec.count++;
+    }
+    if (accRec.count >= MAX_LOGIN_FAILURES) {
+      accRec.lockedUntil = now + LOGIN_LOCKOUT_MS;
+    }
+    loginFailuresByAccount.set(accountKey, accRec);
+  }
+  if (loginFailuresByIP.size > 500) {
+    for (const [k, v] of loginFailuresByIP.entries()) {
+      if (v.lockedUntil <= now && v.count < MAX_LOGIN_FAILURES) {
+        loginFailuresByIP.delete(k);
+      }
+    }
+  }
+  if (loginFailuresByAccount.size > 500) {
+    for (const [k, v] of loginFailuresByAccount.entries()) {
+      if (v.lockedUntil <= now && v.count < MAX_LOGIN_FAILURES) {
+        loginFailuresByAccount.delete(k);
+      }
+    }
+  }
+}
 app.post("/api/auth/login", (req, res) => {
-  const { userId, email, password } = req.body || {};
-  const user = users.find((u) => (u.id === userId || u.email === email) && u.password === password);
-  if (!user) {
+  if (!req.body || typeof req.body !== "object") {
+    return res.status(401).json({ error: "Request body required" });
+  }
+  const clientIp = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "127.0.0.1");
+  const now = Date.now();
+  const ipRecord = loginFailuresByIP.get(clientIp);
+  if (ipRecord && ipRecord.lockedUntil > now) {
+    const retryAfterSec = Math.ceil((ipRecord.lockedUntil - now) / 1e3);
+    return res.status(429).json({ error: `Too many failed login attempts from this IP. Please try again in ${retryAfterSec} seconds.` });
+  }
+  const { userId, email, password } = req.body;
+  if (typeof password !== "string" || password.trim().length === 0) {
+    return res.status(401).json({ error: "Password is required and must be a non-empty string" });
+  }
+  const lookupId = typeof userId === "string" && userId.trim() ? userId.trim() : null;
+  const lookupEmail = typeof email === "string" && email.trim() ? email.trim().toLowerCase() : null;
+  if (!lookupId && !lookupEmail) {
+    return res.status(401).json({ error: "A valid userId or email is required" });
+  }
+  const accountKey = lookupEmail || lookupId || "";
+  const accRecord = loginFailuresByAccount.get(accountKey);
+  if (accRecord && accRecord.lockedUntil > now) {
+    const retryAfterSec = Math.ceil((accRecord.lockedUntil - now) / 1e3);
+    return res.status(429).json({ error: `Too many failed login attempts for this account. Please try again in ${retryAfterSec} seconds.` });
+  }
+  const user = users.find((u) => lookupId && u.id === lookupId || lookupEmail && u.email && u.email.toLowerCase() === lookupEmail);
+  if (!user || typeof user.password !== "string" || user.password.trim().length === 0) {
+    recordLoginFailure(clientIp, accountKey, now);
     return res.status(401).json({ error: "Invalid credentials or user not found" });
   }
+  const suppliedBuf = Buffer.from(password);
+  const storedBuf = Buffer.from(user.password);
+  const isMatch = suppliedBuf.length === storedBuf.length && timingSafeEqual(suppliedBuf, storedBuf);
+  if (!isMatch) {
+    recordLoginFailure(clientIp, accountKey, now);
+    return res.status(401).json({ error: "Invalid credentials or user not found" });
+  }
+  loginFailuresByIP.delete(clientIp);
+  if (accountKey) {
+    loginFailuresByAccount.delete(accountKey);
+  }
   const token = signToken({ id: user.id, role: user.role, email: user.email });
-  res.json({
+  return res.json({
     success: true,
     token,
     user: {
@@ -69910,11 +70014,30 @@ function safeUser(user) {
   return safe;
 }
 function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    const token = authHeader.slice(7).trim();
+    if (ADMIN_TOKEN && ADMIN_TOKEN.length > 0 && token === ADMIN_TOKEN) {
+      req.authenticatedUserId = "user_admin";
+      return next();
+    }
+  }
   const userId = resolveAuthenticatedUserId(req);
   if (!userId) {
     return res.status(401).json({ error: "Unauthorized: Authentication required" });
   }
+  const u = users.find((user) => user.id === userId);
+  if (!u) {
+    return res.status(401).json({ error: "Unauthorized: User account not found" });
+  }
+  if (u.status !== "active") {
+    return res.status(403).json({
+      error: `Forbidden: Account is ${u.status}. Access denied.`,
+      status: u.status
+    });
+  }
   req.authenticatedUserId = userId;
+  req.authenticatedUser = u;
   next();
 }
 function adminActor(req) {
@@ -69935,34 +70058,59 @@ function ALLOWED_ROLES_CHECK(role, allowed) {
 }
 function requireRole(allowedRoles) {
   return (req, res, next) => {
-    if (req.headers.authorization) {
-      const header = String(req.headers.authorization);
-      const given = header.startsWith("Bearer ") ? header.slice(7) : "";
-      if (ADMIN_TOKEN && given === ADMIN_TOKEN) return next();
-      return res.status(401).json({ error: "Invalid authentication token" });
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      const token = authHeader.slice(7).trim();
+      if (ADMIN_TOKEN && ADMIN_TOKEN.length > 0 && token === ADMIN_TOKEN) {
+        return next();
+      }
     }
     const userId = resolveAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized: Authentication required" });
+    }
     const u = users.find((user) => user.id === userId);
-    if (!u) return res.status(401).json({ error: "Authentication required" });
-    if (!ALLOWED_ROLES_CHECK(u.role, allowedRoles)) {
+    if (!u) {
+      return res.status(401).json({ error: "Unauthorized: User account not found" });
+    }
+    if (u.status !== "active") {
+      return res.status(403).json({ error: `Forbidden: Account is ${u.status}. Access denied.` });
+    }
+    const role = u.role;
+    if (!role || !ALLOWED_ROLES_CHECK(role, allowedRoles)) {
       return res.status(403).json({ error: `Forbidden: Insufficient privileges (required: ${allowedRoles.join(", ")})` });
     }
+    req.authenticatedUserId = userId;
+    req.authenticatedUser = u;
     next();
   };
 }
 function requireAdmin(req, res, next) {
-  if (ADMIN_TOKEN) {
-    const header = String(req.headers.authorization || "");
-    const given = header.startsWith("Bearer ") ? header.slice(7) : "";
-    if (given && given === ADMIN_TOKEN) return next();
-    return res.status(401).json({ error: "Invalid authentication token" });
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    const token = authHeader.slice(7).trim();
+    if (ADMIN_TOKEN && ADMIN_TOKEN.length > 0 && token === ADMIN_TOKEN) {
+      return next();
+    }
   }
   const userId = resolveAuthenticatedUserId(req);
+  if (!userId) {
+    return res.status(401).json({ error: "Unauthorized: Authentication required" });
+  }
   const u = users.find((user) => user.id === userId);
-  if (u && (u.role === "admin" || u.role === "super_admin")) {
+  if (!u) {
+    return res.status(401).json({ error: "Unauthorized: User account not found" });
+  }
+  if (u.status !== "active") {
+    return res.status(403).json({ error: `Forbidden: Admin account is ${u.status}` });
+  }
+  const role = u.role;
+  if (role === "admin" || role === "super_admin") {
+    req.authenticatedUserId = userId;
+    req.authenticatedUser = u;
     return next();
   }
-  return res.status(401).json({ error: "Access denied" });
+  return res.status(403).json({ error: "Forbidden: Admin access required" });
 }
 var rateBuckets = /* @__PURE__ */ new Map();
 function rateLimit(max, windowMs) {
@@ -70001,6 +70149,9 @@ app.use(["/api/payouts", "/api/refunds", "/api/audit-logs"], (req, res, next) =>
 });
 var server = createServer(app);
 var wss = new import_websocket_server.default({ server });
+wss.on("error", (err) => {
+  console.error("WSS Server error:", err);
+});
 var ai = new GoogleGenAI2({
   apiKey: process.env.GEMINI_API_KEY || "dummy_key",
   httpOptions: {
@@ -70047,6 +70198,14 @@ Reason/Notes: ${notes || "Account compliance review / policy warning"}.
 
 Certain actions (such as creating new gigs or submitting bids) are currently limited. Please contact our Support Desk to resolve these restrictions.`;
     chatText = `\u26A0\uFE0F ACCOUNT NOTICE: Your WorkSphere account privileges have been RESTRICTED by Platform Administration. Please Contact Support Desk for assistance and clarification.`;
+  } else if (action === "deactivated") {
+    emailSubject = `[NOTICE] WorkSphere Account Deactivated`;
+    emailBody = `Dear ${user.name},
+
+Your WorkSphere account (${user.email}) has been DEACTIVATED by Platform Administration.
+
+Reason/Notes: ${notes || "Account deactivated"}.`;
+    chatText = `\u{1F6A8} ACCOUNT ALERT: Your WorkSphere account has been DEACTIVATED.`;
   } else if (action === "impersonated") {
     emailSubject = `[SECURITY NOTICE] Administrative Support Session Initialized`;
     emailBody = `Dear ${user.name},
@@ -70062,7 +70221,7 @@ If you have any questions or security concerns, please contact support immediate
     userEmail: user.email,
     subject: emailSubject,
     body: emailBody,
-    type: action === "suspended" ? "SUSPEND" : action === "restricted" ? "RESTRICT" : "IMPERSONATE",
+    type: action === "suspended" ? "SUSPEND" : action === "restricted" ? "RESTRICT" : action === "deactivated" ? "DEACTIVATE" : "IMPERSONATE",
     sentAt: timestamp,
     read: false
   };
@@ -70094,6 +70253,8 @@ If you have any questions or security concerns, please contact support immediate
     console.error("WS notify error:", err);
   }
 }
+var DEV_DEMO_PASSWORD = "password123";
+var DEV_ADMIN_PASSWORD = "adminpassword123";
 var users = [
   {
     id: "user_1",
@@ -70113,7 +70274,7 @@ var users = [
     verified: true,
     walletBalance: 4250,
     createdAt: "2025-01-15",
-    password: IS_PROD ? randomUUID2() : "password123"
+    password: IS_PROD ? void 0 : DEV_DEMO_PASSWORD
   },
   {
     id: "user_2",
@@ -70133,7 +70294,7 @@ var users = [
     verified: true,
     walletBalance: 12e3,
     createdAt: "2025-02-01",
-    password: IS_PROD ? randomUUID2() : "password123"
+    password: IS_PROD ? void 0 : DEV_DEMO_PASSWORD
   },
   {
     id: "user_admin",
@@ -70153,7 +70314,7 @@ var users = [
     verified: true,
     walletBalance: 0,
     createdAt: "2025-01-01",
-    password: IS_PROD ? randomUUID2() : "adminpassword123"
+    password: IS_PROD ? process.env.ADMIN_PASSWORD || void 0 : DEV_ADMIN_PASSWORD
   },
   {
     id: "user_bk",
@@ -70173,7 +70334,8 @@ var users = [
     status: "active",
     verified: true,
     walletBalance: 3450,
-    createdAt: "2025-01-10"
+    createdAt: "2025-01-10",
+    password: IS_PROD ? void 0 : DEV_DEMO_PASSWORD
   },
   {
     id: "user_3",
@@ -70193,7 +70355,8 @@ var users = [
     status: "active",
     verified: true,
     walletBalance: 1850,
-    createdAt: "2025-02-15"
+    createdAt: "2025-02-15",
+    password: IS_PROD ? void 0 : DEV_DEMO_PASSWORD
   }
 ];
 var gigs = [
@@ -70947,8 +71110,78 @@ function splitOrderFunds(order, refundAmount, actor, reason, requestKey) {
 app.get("/api/users", requireRole(["admin", "super_admin"]), (req, res) => {
   res.json(users.map(safeUser));
 });
-app.get("/api/gigs", (req, res) => res.json(gigs));
-app.get("/api/projects", (req, res) => res.json(projects));
+function sanitizePublicGig(g) {
+  const { moderationStatus, moderationNotes, ...publicGig } = g;
+  return publicGig;
+}
+function sanitizePublicProject(p) {
+  const { moderationStatus, moderationNotes, ...publicProj } = p;
+  return publicProj;
+}
+function isGigPublic(g) {
+  if (g.status !== "published") return false;
+  if (g.moderationStatus && g.moderationStatus !== "approved") return false;
+  const author = users.find((u) => u.id === g.freelancerId);
+  if (author && author.status !== "active") return false;
+  return true;
+}
+function isProjectPublic(p) {
+  if (p.status !== "open" && p.status !== "published") return false;
+  if (p.moderationStatus && p.moderationStatus !== "approved") return false;
+  const author = users.find((u) => u.id === p.buyerId);
+  if (author && author.status !== "active") return false;
+  return true;
+}
+app.get("/api/gigs", (req, res) => {
+  const publicGigs = gigs.filter(isGigPublic).map(sanitizePublicGig);
+  res.json(publicGigs);
+});
+app.get("/api/projects", (req, res) => {
+  const publicProjects = projects.filter(isProjectPublic).map(sanitizePublicProject);
+  res.json(publicProjects);
+});
+app.get("/api/gigs/:id", (req, res) => {
+  const gig = gigs.find((g) => g.id === req.params.id);
+  if (!gig) return res.status(404).json({ error: "Gig not found" });
+  const authUserId = resolveAuthenticatedUserId(req);
+  const caller = authUserId ? users.find((u) => u.id === authUserId) : null;
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin";
+  const isOwner = authUserId && gig.freelancerId === authUserId;
+  if (isGigPublic(gig)) {
+    if (isAdmin || isOwner) return res.json(gig);
+    return res.json(sanitizePublicGig(gig));
+  }
+  if (isAdmin || isOwner) {
+    return res.json(gig);
+  }
+  return res.status(404).json({ error: "Gig not found or unavailable" });
+});
+app.get("/api/projects/:id", (req, res) => {
+  const project = projects.find((p) => p.id === req.params.id);
+  if (!project) return res.status(404).json({ error: "Project not found" });
+  const authUserId = resolveAuthenticatedUserId(req);
+  const caller = authUserId ? users.find((u) => u.id === authUserId) : null;
+  const isAdmin = caller?.role === "admin" || caller?.role === "super_admin";
+  const isOwner = authUserId && project.buyerId === authUserId;
+  if (isProjectPublic(project)) {
+    if (isAdmin || isOwner) return res.json(project);
+    return res.json(sanitizePublicProject(project));
+  }
+  if (isAdmin || isOwner) {
+    return res.json(project);
+  }
+  return res.status(404).json({ error: "Project not found or unavailable" });
+});
+app.get("/api/my/gigs", requireAuth, (req, res) => {
+  const authUserId = req.authenticatedUserId;
+  const myGigs = gigs.filter((g) => g.freelancerId === authUserId);
+  res.json(myGigs);
+});
+app.get("/api/my/projects", requireAuth, (req, res) => {
+  const authUserId = req.authenticatedUserId;
+  const myProjects = projects.filter((p) => p.buyerId === authUserId);
+  res.json(myProjects);
+});
 app.get("/api/proposals", requireAuth, (req, res) => {
   const authUserId = req.authenticatedUserId;
   const caller = users.find((u) => u.id === authUserId);
@@ -71034,6 +71267,10 @@ app.post("/api/orders/:id/deliverable", requireAuth, (req, res) => {
   if (!isAdmin && order.sellerId !== authUserId) {
     return res.status(403).json({ error: "Unauthorized: Only seller can upload deliverables." });
   }
+  const allowedStatuses = ["funded_in_escrow", "in_progress", "revision"];
+  if (!allowedStatuses.includes(order.status)) {
+    return res.status(409).json({ error: `Cannot submit a deliverable for an order in "${order.status}" status.` });
+  }
   if (!order.deliverableFiles) order.deliverableFiles = [];
   const newFile = {
     id: "deliv_" + Date.now(),
@@ -71043,9 +71280,7 @@ app.post("/api/orders/:id/deliverable", requireAuth, (req, res) => {
     uploadedAt: (/* @__PURE__ */ new Date()).toLocaleString([], { dateStyle: "short", timeStyle: "short" })
   };
   order.deliverableFiles.push(newFile);
-  if (order.status !== "completed" && order.status !== "disputed") {
-    order.status = "delivered";
-  }
+  order.status = "delivered";
   const sysMsg = {
     id: "msg_" + Date.now(),
     orderId: order.id,
@@ -71112,10 +71347,16 @@ app.post("/api/users/:id/flag", requireAdmin, (req, res) => {
   });
   res.json({ success: true, isFlagged: user.isFlagged, flagReason: user.flagReason, user });
 });
-app.post("/api/orders/:id/force-complete", (req, res) => {
+app.post("/api/orders/:id/force-complete", requireAdmin, (req, res) => {
   try {
     const order = orders.find((o) => o.id === req.params.id);
     if (!order) return res.status(404).json({ error: "Order not found" });
+    if (order.status === "completed") {
+      return res.status(400).json({ error: "Order is already completed; funds were already released." });
+    }
+    if (order.status === "cancelled") {
+      return res.status(400).json({ error: "Cannot force-complete a cancelled/refunded order." });
+    }
     const reason = String(req.body.reason || "Admin administrative force-release in seller favor.");
     const result = releaseOrderFunds(order, adminActor(req), reason, req.body.requestKey);
     closeActiveDispute(order.id, "resolved_release", reason);
@@ -71125,10 +71366,16 @@ app.post("/api/orders/:id/force-complete", (req, res) => {
     res.status(400).json({ error: err.message });
   }
 });
-app.post("/api/orders/:id/force-cancel", (req, res) => {
+app.post("/api/orders/:id/force-cancel", requireAdmin, (req, res) => {
   try {
     const order = orders.find((o) => o.id === req.params.id);
     if (!order) return res.status(404).json({ error: "Order not found" });
+    if (order.status === "completed") {
+      return res.status(400).json({ error: "Cannot force-cancel an already completed order." });
+    }
+    if (order.status === "cancelled") {
+      return res.status(400).json({ error: "Order is already cancelled/refunded." });
+    }
     const reason = String(req.body.reason || "Admin cancelled order and refunded buyer wallet");
     const isPartial = req.body.refundType === "partial";
     let result;
@@ -71374,12 +71621,32 @@ function handlePayoutRequest(req, res) {
     res.status(400).json({ error: err.message });
   }
 }
-app.post("/api/payments/deposit", rateLimit(10, 6e4), (req, res) => {
+app.post("/api/payments/deposit", requireAuth, rateLimit(10, 6e4), (req, res) => {
   try {
-    if (IS_PROD && process.env.ALLOW_SIMULATED_DEPOSITS !== "true") {
+    if (!areSimulatedDepositsAllowed()) {
       return res.status(501).json({ error: "Deposits require a connected payment gateway in production." });
     }
-    const userId = String(req.body?.userId || "");
+    const authUserId = req.authenticatedUserId;
+    if (!authUserId) {
+      return res.status(401).json({ error: "Unauthorized: Authentication required" });
+    }
+    const caller = users.find((u) => u.id === authUserId);
+    if (!caller) {
+      return res.status(401).json({ error: "Authenticated user not found" });
+    }
+    const requestedUserId = req.body?.userId;
+    let targetUserId = authUserId;
+    if (requestedUserId && requestedUserId !== authUserId) {
+      const isAdmin = caller.role === "admin" || caller.role === "super_admin";
+      if (!isAdmin) {
+        return res.status(403).json({ error: "Forbidden: You cannot deposit funds into another user wallet." });
+      }
+      const targetUser = users.find((u) => u.id === requestedUserId);
+      if (!targetUser) {
+        return res.status(404).json({ error: "Target user not found" });
+      }
+      targetUserId = requestedUserId;
+    }
     const amount = Number(req.body?.amount);
     if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ error: "Please enter a valid deposit amount greater than $0.00" });
@@ -71387,27 +71654,25 @@ app.post("/api/payments/deposit", rateLimit(10, 6e4), (req, res) => {
     if (amount > 5e3) {
       return res.status(400).json({ error: "Simulated deposits are limited to $5,000." });
     }
-    const u = users.find((user) => user.id === userId);
-    if (!u) return res.status(404).json({ error: "User not found" });
-    ensureWallet(u.id);
+    ensureWallet(targetUserId);
     const key = String(req.body?.idempotencyKey || req.body?.providerReference || randomUUID2());
     const result = financeLedger.creditDeposit({
-      userId: u.id,
+      userId: targetUserId,
       amount,
       reference: `SIM-${key}`,
-      idempotencyKey: `SIM-${u.id}-${key}`,
-      actor: "Simulated Gateway",
+      idempotencyKey: `SIM-${targetUserId}-${key}`,
+      actor: `${caller.name} (Simulated)`,
       source: "simulated"
     });
     syncUserBalances();
-    const newBalance = financeLedger.getWalletBalance(u.id) ?? u.walletBalance;
+    const newBalance = financeLedger.getWalletBalance(targetUserId) ?? caller.walletBalance;
     const transaction = financeLedger.getTransactions().find((t2) => t2.journalId === result.journal.id);
     auditLogs.unshift({
       id: "log_" + Date.now(),
-      actor: u.name,
-      role: u.role,
+      actor: caller.name,
+      role: caller.role,
       action: "FUNDS_DEPOSITED",
-      target: `User ${u.name}`,
+      target: `User ${caller.name}`,
       details: `Deposited $${amount.toFixed(2)} (simulated). New Balance: $${newBalance.toFixed(2)}`,
       timestamp: (/* @__PURE__ */ new Date()).toLocaleString()
     });
@@ -71416,7 +71681,7 @@ app.post("/api/payments/deposit", rateLimit(10, 6e4), (req, res) => {
     res.status(400).json({ error: err.message });
   }
 });
-app.post("/api/payments/withdraw", rateLimit(10, 6e4), handlePayoutRequest);
+app.post("/api/payments/withdraw", requireAuth, rateLimit(10, 6e4), handlePayoutRequest);
 app.post("/api/payments/escrow/release", requireAuth, (req, res) => {
   try {
     const userId = req.authenticatedUserId;
@@ -71431,12 +71696,28 @@ app.post("/api/payments/escrow/release", requireAuth, (req, res) => {
     if (order.status === "completed") {
       return res.status(400).json({ error: "Order escrow has already been released and completed." });
     }
+    if (order.status === "cancelled") {
+      return res.status(400).json({ error: "Cannot release escrow: Order has already been cancelled/refunded." });
+    }
+    const activeDispute = disputes.find((d) => d.orderId === order.id && (d.status === "open" || d.status === "under_investigation"));
+    if (activeDispute || order.status === "disputed") {
+      return res.status(400).json({ error: "Cannot release escrow: Order is under active dispute. Resolve the dispute first." });
+    }
+    const releasableStatuses = ["delivered", "in_progress", "revision", "funded_in_escrow"];
+    if (!releasableStatuses.includes(order.status)) {
+      return res.status(400).json({ error: `Cannot release escrow for order in "${order.status}" status.` });
+    }
+    const esc = financeLedger.getEscrow(order.id);
+    if (!esc || esc.remaining <= 0 || esc.status === "released" || esc.status === "refunded") {
+      return res.status(400).json({ error: "No refundable or releasable escrow funds remain for this order." });
+    }
     const seller = users.find((u) => u.id === order.sellerId);
     const buyer = users.find((u) => u.id === order.buyerId);
     if (seller) ensureWallet(seller.id);
     if (buyer) ensureWallet(buyer.id);
-    const actorName = caller?.name || buyer?.name || "Authorized Buyer";
-    const result = releaseOrderFunds(order, actorName, "Buyer approved work");
+    const actorName = isAdmin ? adminActor(req) : buyer?.name || "Authorized Buyer";
+    const requestKey = req.body?.requestKey || req.body?.idempotencyKey;
+    const result = releaseOrderFunds(order, actorName, "Buyer approved work", requestKey);
     auditLogs.unshift({
       id: "log_" + Date.now(),
       actor: actorName,
@@ -71459,23 +71740,45 @@ app.post("/api/payments/escrow/refund", requireAuth, (req, res) => {
     const order = orders.find((o) => o.id === orderId);
     if (!order) return res.status(404).json({ error: "Order not found" });
     const isAdmin = caller?.role === "admin" || caller?.role === "super_admin";
-    if (!isAdmin && userId !== order.buyerId && userId !== order.sellerId) {
-      return res.status(403).json({ error: "Unauthorized: Only order participants or administrators can refund escrow." });
+    const isBuyer = userId === order.buyerId;
+    const isSeller = userId === order.sellerId;
+    if (!isAdmin && !isBuyer && !isSeller) {
+      return res.status(403).json({ error: "Unauthorized: Only order participants or administrators can access escrow refund." });
+    }
+    if (order.status === "completed") {
+      return res.status(400).json({ error: "Cannot refund order: Escrow funds have already been released to seller." });
     }
     if (order.status === "cancelled") {
       return res.status(400).json({ error: "Order is already cancelled/refunded." });
     }
+    const activeDispute = disputes.find((d) => d.orderId === order.id && (d.status === "open" || d.status === "under_investigation"));
+    if (activeDispute || order.status === "disputed") {
+      return res.status(400).json({ error: "Cannot refund order: Order is under active dispute. It must be resolved through dispute resolution." });
+    }
+    const esc = financeLedger.getEscrow(order.id);
+    if (!esc || esc.remaining <= 0 || esc.status === "released" || esc.status === "refunded") {
+      return res.status(400).json({ error: "No refundable escrow funds remaining for this order." });
+    }
+    if (isBuyer && !isAdmin) {
+      if (order.status === "delivered" || order.deliverableFiles && order.deliverableFiles.length > 0) {
+        return res.status(403).json({ error: "Cannot unilaterally refund a delivered order. If work is unsatisfactory, please request a revision or file a dispute." });
+      }
+      if (order.status === "in_progress" || order.status === "revision") {
+        return res.status(403).json({ error: "Cannot unilaterally refund an active order in progress. The seller must initiate cancellation or a dispute must be filed." });
+      }
+    }
     const buyer = users.find((u) => u.id === order.buyerId);
     if (buyer) ensureWallet(buyer.id);
-    const actorName = caller?.name || buyer?.name || "Buyer";
-    const result = refundOrderFunds(order, void 0, actorName, reason || "Escrow cancellation");
+    const actorName = isAdmin ? adminActor(req) : caller?.name || (isSeller ? "Seller" : "Buyer");
+    const requestKey = req.body?.requestKey || req.body?.idempotencyKey;
+    const result = refundOrderFunds(order, void 0, actorName, reason || (isSeller ? "Seller cancelled order" : "Escrow cancellation"), requestKey);
     auditLogs.unshift({
       id: "log_" + Date.now(),
       actor: actorName,
-      role: caller?.role || "buyer",
-      action: "ESCROW_REFUNDED_BY_BUYER",
+      role: caller?.role || (isSeller ? "seller" : "buyer"),
+      action: isSeller ? "ESCROW_REFUNDED_BY_SELLER" : isAdmin ? "ESCROW_REFUNDED_BY_ADMIN" : "ESCROW_REFUNDED_BY_BUYER",
       target: `Order #${order.id}`,
-      details: `Escrow refund requested of $${result.refunded} to wallet. Reason: ${reason || "Escrow cancellation"}`,
+      details: `Escrow refund executed of $${result.refunded} to buyer wallet. Reason: ${reason || "Escrow cancellation"}`,
       timestamp: (/* @__PURE__ */ new Date()).toLocaleString()
     });
     res.json({ success: true, order, refunded: result.refunded });
@@ -71865,9 +72168,19 @@ app.post("/api/admin/finance/escrow/:orderId/release", (req, res) => {
   try {
     const order = orders.find((o) => o.id === req.params.orderId);
     if (!order) return res.status(404).json({ error: "Order not found" });
+    if (order.status === "completed") {
+      return res.status(400).json({ error: "Order escrow has already been released and completed." });
+    }
+    if (order.status === "cancelled") {
+      return res.status(400).json({ error: "Cannot release escrow: Order has already been cancelled/refunded." });
+    }
     const activeDispute = disputes.find((d) => d.orderId === order.id && (d.status === "open" || d.status === "under_investigation"));
-    if (activeDispute) {
-      return res.status(400).json({ error: `Cannot release escrow: Order #${order.id} is under active dispute (${activeDispute.id}). Resolve the dispute first.` });
+    if (activeDispute || order.status === "disputed") {
+      return res.status(400).json({ error: `Cannot release escrow: Order #${order.id} is under active dispute. Resolve the dispute first.` });
+    }
+    const esc = financeLedger.getEscrow(order.id);
+    if (!esc || esc.remaining <= 0 || esc.status === "released" || esc.status === "refunded") {
+      return res.status(400).json({ error: "No refundable or releasable escrow funds remain for this order." });
     }
     const result = releaseOrderFunds(order, adminActor(req), String(req.body.reason || "Administrative escrow release"), req.body.requestKey);
     res.json({ success: true, order, journal: result.journal, freelancerNet: result.freelancerNet, platformFee: result.platformFee });
@@ -71879,6 +72192,16 @@ app.post("/api/admin/finance/escrow/:orderId/refund", (req, res) => {
   try {
     const order = orders.find((o) => o.id === req.params.orderId);
     if (!order) return res.status(404).json({ error: "Order not found" });
+    if (order.status === "completed") {
+      return res.status(400).json({ error: "Cannot refund order: Escrow funds have already been released to seller." });
+    }
+    if (order.status === "cancelled") {
+      return res.status(400).json({ error: "Order is already cancelled/refunded." });
+    }
+    const esc = financeLedger.getEscrow(order.id);
+    if (!esc || esc.remaining <= 0 || esc.status === "released" || esc.status === "refunded") {
+      return res.status(400).json({ error: "No refundable escrow funds remaining for this order." });
+    }
     const amount = req.body.amount === void 0 || req.body.amount === "" ? void 0 : Number(req.body.amount);
     const result = refundOrderFunds(order, amount, adminActor(req), String(req.body.reason || "Administrative escrow refund approval"), req.body.requestKey);
     closeActiveDispute(order.id, "resolved_refund", String(req.body.reason || "Administrative escrow refund"));
@@ -71995,21 +72318,52 @@ app.post("/api/admin/finance/payouts/:id/retry", retryPayout);
 app.patch("/api/admin/payouts/:id/approve", approvePayout);
 app.patch("/api/admin/payouts/:id/process", processPayout);
 app.patch("/api/admin/payouts/:id/fail", failPayout);
-app.post("/api/payouts", rateLimit(10, 6e4), handlePayoutRequest);
-app.post("/api/wallet/deposit", rateLimit(10, 6e4), (req, res) => {
+app.post("/api/payouts", requireAuth, rateLimit(10, 6e4), handlePayoutRequest);
+app.post("/api/wallet/deposit", requireAuth, rateLimit(10, 6e4), (req, res) => {
   try {
-    if (IS_PROD && process.env.ALLOW_SIMULATED_DEPOSITS !== "true") {
-      return res.status(501).json({ error: "Deposits require a connected payment gateway." });
+    if (!areSimulatedDepositsAllowed()) {
+      return res.status(501).json({ error: "Deposits require a connected payment gateway in production." });
     }
-    const userId = String(req.body?.userId || "");
+    const authUserId = req.authenticatedUserId;
+    if (!authUserId) {
+      return res.status(401).json({ error: "Unauthorized: Authentication required" });
+    }
+    const caller = users.find((u) => u.id === authUserId);
+    if (!caller) {
+      return res.status(401).json({ error: "Authenticated user not found" });
+    }
+    const requestedUserId = req.body?.userId;
+    let targetUserId = authUserId;
+    if (requestedUserId && requestedUserId !== authUserId) {
+      const isAdmin = caller.role === "admin" || caller.role === "super_admin";
+      if (!isAdmin) {
+        return res.status(403).json({ error: "Forbidden: You cannot deposit funds into another user wallet." });
+      }
+      const targetUser = users.find((u) => u.id === requestedUserId);
+      if (!targetUser) {
+        return res.status(404).json({ error: "Target user not found" });
+      }
+      targetUserId = requestedUserId;
+    }
     const amount = Number(req.body?.amount);
-    if (!users.some((u) => u.id === userId)) return res.status(404).json({ error: "User not found" });
-    ensureWallet(userId);
-    if (Number.isFinite(amount) && amount > 5e3) return res.status(400).json({ error: "Simulated deposits are limited to $5,000." });
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: "Please enter a valid deposit amount greater than $0.00" });
+    }
+    if (amount > 5e3) {
+      return res.status(400).json({ error: "Simulated deposits are limited to $5,000." });
+    }
+    ensureWallet(targetUserId);
     const key = String(req.body?.idempotencyKey || randomUUID2());
-    const { replayed } = financeLedger.creditDeposit({ userId, amount, reference: `SIM-${key}`, idempotencyKey: `SIM-${userId}-${key}`, actor: "Simulated Gateway", source: "simulated" });
+    const { replayed } = financeLedger.creditDeposit({
+      userId: targetUserId,
+      amount,
+      reference: `SIM-${key}`,
+      idempotencyKey: `SIM-${targetUserId}-${key}`,
+      actor: `${caller.name} (Simulated)`,
+      source: "simulated"
+    });
     syncUserBalances();
-    res.json({ success: true, replayed, balance: financeLedger.getWalletBalance(userId) });
+    res.json({ success: true, replayed, balance: financeLedger.getWalletBalance(targetUserId) });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -72330,10 +72684,10 @@ app.get("/api/messages/:orderId", requireAuth, (req, res) => {
   const filtered = messages.filter((m2) => m2.orderId === req.params.orderId);
   res.json(filtered);
 });
-app.post("/api/messages", (req, res) => {
-  const authUserId = resolveUserId(req);
-  const caller = users.find((u) => u.id === authUserId);
-  if (!caller) return res.status(401).json({ error: "Authentication required" });
+app.post("/api/messages", requireAuth, (req, res) => {
+  const authUserId = req.authenticatedUserId;
+  const caller = req.authenticatedUser || users.find((u) => u.id === authUserId);
+  if (!caller || caller.status !== "active") return res.status(403).json({ error: "Account is not active" });
   const orderId = req.body.orderId;
   const order = orders.find((o) => o.id === orderId);
   if (!order) return res.status(404).json({ error: "Order not found" });
@@ -72350,12 +72704,13 @@ app.post("/api/messages", (req, res) => {
     timestamp: (/* @__PURE__ */ new Date()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
   };
   messages.push(newMsg);
+  broadcastMessage(newMsg, order.id);
   res.json(newMsg);
 });
-app.post("/api/gigs", (req, res) => {
-  const authUserId = resolveUserId(req);
-  const caller = users.find((u) => u.id === authUserId);
-  if (!caller) return res.status(401).json({ error: "Authentication required" });
+app.post("/api/gigs", requireAuth, (req, res) => {
+  const authUserId = req.authenticatedUserId;
+  const caller = req.authenticatedUser || users.find((u) => u.id === authUserId);
+  if (!caller || caller.status !== "active") return res.status(403).json({ error: "Account is not active" });
   const newGig = {
     id: "gig_" + Date.now(),
     freelancerId: caller.id,
@@ -72380,10 +72735,10 @@ app.post("/api/gigs", (req, res) => {
   gigs.unshift(newGig);
   res.json(newGig);
 });
-app.post("/api/projects", (req, res) => {
-  const authUserId = resolveUserId(req);
-  const caller = users.find((u) => u.id === authUserId);
-  if (!caller) return res.status(401).json({ error: "Authentication required" });
+app.post("/api/projects", requireAuth, (req, res) => {
+  const authUserId = req.authenticatedUserId;
+  const caller = req.authenticatedUser || users.find((u) => u.id === authUserId);
+  if (!caller || caller.status !== "active") return res.status(403).json({ error: "Account is not active" });
   const newProj = {
     id: "proj_" + Date.now(),
     buyerId: caller.id,
@@ -72403,6 +72758,9 @@ app.post("/api/projects", (req, res) => {
   };
   projects.unshift(newProj);
   res.json(newProj);
+});
+app.get("/api/admin/projects", (req, res) => {
+  res.json(projects);
 });
 app.patch("/api/admin/projects/:id", (req, res) => {
   const p = projects.find((proj) => proj.id === req.params.id);
@@ -72476,6 +72834,9 @@ app.delete("/api/admin/projects/:id", (req, res) => {
   });
   res.json({ success: true, id: deleted.id });
 });
+app.get("/api/admin/gigs", (req, res) => {
+  res.json(gigs);
+});
 app.patch("/api/admin/gigs/:id", (req, res) => {
   const g = gigs.find((gig) => gig.id === req.params.id);
   if (!g) return res.status(404).json({ error: "Gig/Service not found" });
@@ -72547,10 +72908,10 @@ app.delete("/api/admin/gigs/:id", (req, res) => {
   });
   res.json({ success: true, id: deleted.id });
 });
-app.post("/api/proposals", (req, res) => {
-  const authUserId = resolveUserId(req);
-  const caller = users.find((u) => u.id === authUserId);
-  if (!caller) return res.status(401).json({ error: "Authentication required" });
+app.post("/api/proposals", requireAuth, (req, res) => {
+  const authUserId = req.authenticatedUserId;
+  const caller = req.authenticatedUser || users.find((u) => u.id === authUserId);
+  if (!caller || caller.status !== "active") return res.status(403).json({ error: "Account is not active" });
   const newProp = {
     id: "prop_" + Date.now(),
     projectId: req.body.projectId,
@@ -72569,11 +72930,11 @@ app.post("/api/proposals", (req, res) => {
   if (proj) proj.proposalsCount += 1;
   res.json(newProp);
 });
-app.post("/api/orders", rateLimit(30, 6e4), (req, res) => {
+app.post("/api/orders", requireAuth, rateLimit(30, 6e4), (req, res) => {
   try {
-    const authUserId = resolveUserId(req);
-    const caller = users.find((u) => u.id === authUserId);
-    if (!caller) return res.status(401).json({ error: "Authentication required" });
+    const authUserId = req.authenticatedUserId;
+    const caller = req.authenticatedUser || users.find((u) => u.id === authUserId);
+    if (!caller || caller.status !== "active") return res.status(403).json({ error: "Account is not active" });
     const title = typeof req.body?.title === "string" ? req.body.title.trim() : "";
     if (title.length < 3) return res.status(400).json({ error: "A valid order title is required." });
     const buyerId = caller.id;
@@ -72708,7 +73069,14 @@ app.patch("/api/admin/users/:id/status", (req, res) => {
     details: `Changed account status from ${oldStatus} to ${req.body.status}`,
     timestamp: (/* @__PURE__ */ new Date()).toLocaleString()
   });
-  if (req.body.status === "suspended" || req.body.status === "restricted") {
+  if (u.status !== "active") {
+    for (const client of clients) {
+      if (client.authenticatedUserId === u.id) {
+        client.close(1008, `Account is ${u.status}`);
+      }
+    }
+  }
+  if (req.body.status === "suspended" || req.body.status === "restricted" || req.body.status === "deactivated") {
     notifyUserOnAdminAction(u, req.body.status, req.body.notes);
   }
   res.json(u);
@@ -72780,6 +73148,11 @@ app.delete("/api/admin/users/:id", (req, res) => {
     details: `Permanently deleted user account ${deletedUser.email} and cleared their associated gigs & projects`,
     timestamp: (/* @__PURE__ */ new Date()).toLocaleString()
   });
+  for (const client of clients) {
+    if (client.authenticatedUserId === req.params.id) {
+      client.close(1008, "Account deleted");
+    }
+  }
   res.json({ success: true, id: deletedUser.id });
 });
 app.patch("/api/admin/disputes/:id/resolve", (req, res) => {
@@ -72877,6 +73250,10 @@ function broadcastMessage(message, orderId) {
     const clientUserId = client.authenticatedUserId;
     if (clientUserId) {
       const clientUser = users.find((u) => u.id === clientUserId);
+      if (!clientUser || clientUser.status !== "active") {
+        client.close(1008, "Account is not active");
+        continue;
+      }
       const isAuthorized = clientUser && (["admin", "super_admin", "support"].includes(clientUser.role) || clientUserId === order.buyerId || clientUserId === order.sellerId);
       if (isAuthorized && client.readyState === import_websocket.default.OPEN) {
         client.send(payload);
@@ -72886,52 +73263,149 @@ function broadcastMessage(message, orderId) {
 }
 var clients = /* @__PURE__ */ new Set();
 wss.on("connection", (ws, req) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const token = url.searchParams.get("token");
-  if (!token) {
-    ws.close(1008, "Authentication token required");
-    return;
-  }
-  const payload = verifyToken(token);
-  if (!payload) {
-    ws.close(1008, "Invalid authentication token");
-    return;
-  }
-  ws.authenticatedUserId = payload.id;
-  clients.add(ws);
-  ws.on("message", (data) => {
+  try {
+    if (!req.url) {
+      ws.close(1008, "Invalid connection URL");
+      return;
+    }
+    const host = req.headers.host || "localhost";
+    let url;
     try {
-      const parsed = JSON.parse(data.toString());
+      url = new URL(req.url, `http://${host}`);
+    } catch {
+      ws.close(1008, "Malformed URL");
+      return;
+    }
+    const token = url.searchParams.get("token");
+    if (!token || typeof token !== "string" || !token.trim()) {
+      ws.close(1008, "Authentication token required");
+      return;
+    }
+    if (ADMIN_TOKEN && ADMIN_TOKEN.length > 0 && token === ADMIN_TOKEN) {
+      ws.authenticatedUserId = "user_admin";
+      clients.add(ws);
+      setupWebSocketHandlers(ws);
+      return;
+    }
+    const payload = verifyToken(token);
+    if (!payload || !payload.id) {
+      ws.close(1008, "Invalid authentication token");
+      return;
+    }
+    const user = users.find((u) => u.id === payload.id);
+    if (!user) {
+      ws.close(1008, "User not found");
+      return;
+    }
+    if (user.status !== "active") {
+      ws.close(1008, `Account is ${user.status}`);
+      return;
+    }
+    ws.authenticatedUserId = user.id;
+    clients.add(ws);
+    setupWebSocketHandlers(ws);
+  } catch (err) {
+    console.error("WS Connection error:", err);
+    try {
+      ws.close(1011, "Server error during connection");
+    } catch {
+    }
+  }
+});
+function setupWebSocketHandlers(ws) {
+  let messageCount = 0;
+  let resetTime = Date.now() + 1e4;
+  ws.on("message", (data, isBinary) => {
+    try {
+      if (isBinary) {
+        ws.send(JSON.stringify({ error: "Binary messages not supported" }));
+        return;
+      }
+      const rawStr = data.toString();
+      if (rawStr.length > 10240) {
+        ws.send(JSON.stringify({ error: "Message payload exceeds maximum allowed size" }));
+        return;
+      }
+      const now = Date.now();
+      if (now > resetTime) {
+        messageCount = 1;
+        resetTime = now + 1e4;
+      } else {
+        messageCount++;
+        if (messageCount > 10) {
+          ws.send(JSON.stringify({ error: "Rate limit exceeded. Please slow down." }));
+          return;
+        }
+      }
+      let parsed;
+      try {
+        parsed = JSON.parse(rawStr);
+      } catch {
+        ws.send(JSON.stringify({ error: "Invalid JSON payload" }));
+        return;
+      }
+      if (!parsed || typeof parsed !== "object") {
+        return;
+      }
       if (parsed.type === "NEW_MESSAGE") {
         const userId = ws.authenticatedUserId;
         if (!userId) {
-          console.error("WS: Unauthenticated message attempt");
+          ws.close(1008, "Unauthenticated message attempt");
           return;
         }
         const user = users.find((u) => u.id === userId);
-        const order = orders.find((o) => o.id === parsed.orderId);
-        if (!order || !user) return;
-        const isAuthorized = order.buyerId === userId || order.sellerId === userId || user.role === "admin" || user.role === "super_admin" || user.role === "support";
-        if (!isAuthorized) return;
+        if (!user || user.status !== "active") {
+          ws.close(1008, "Account is not active");
+          return;
+        }
+        const orderId = parsed.orderId;
+        if (typeof orderId !== "string" || !orderId.trim()) {
+          ws.send(JSON.stringify({ error: "Valid orderId is required" }));
+          return;
+        }
+        const order = orders.find((o) => o.id === orderId.trim());
+        if (!order) {
+          ws.send(JSON.stringify({ error: "Order not found" }));
+          return;
+        }
+        const isAdminOrSupport = user.role === "admin" || user.role === "super_admin" || user.role === "support";
+        if (order.isMuted && !isAdminOrSupport) {
+          ws.send(JSON.stringify({ error: "Chat is currently muted by Administrator." }));
+          return;
+        }
+        const isAuthorized = order.buyerId === userId || order.sellerId === userId || isAdminOrSupport;
+        if (!isAuthorized) {
+          ws.send(JSON.stringify({ error: "Unauthorized to send messages in this order" }));
+          return;
+        }
+        const text = parsed.text;
+        if (typeof text !== "string" || text.trim().length === 0) {
+          ws.send(JSON.stringify({ error: "Message text cannot be empty" }));
+          return;
+        }
+        if (text.length > 2e3) {
+          ws.send(JSON.stringify({ error: "Message text is too long (max 2000 characters)" }));
+          return;
+        }
         const newMsg = {
-          id: "msg_" + Date.now(),
+          id: "msg_" + Date.now() + Math.random().toString(36).substring(2, 5),
           orderId: order.id,
           senderId: user.id,
           senderName: user.name,
-          text: parsed.text,
+          text: text.trim(),
           timestamp: (/* @__PURE__ */ new Date()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
         };
         messages.push(newMsg);
         broadcastMessage(newMsg, order.id);
       }
     } catch (e2) {
-      console.error("WS message error:", e2);
+      console.error("WS message processing error:", e2);
     }
   });
   ws.on("close", () => {
     clients.delete(ws);
   });
-});
+}
 if (process.env.NODE_ENV !== "production") {
   const vite = await createViteServer({
     server: { middlewareMode: true, hmr: false },
